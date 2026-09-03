@@ -1,0 +1,14 @@
+# Test / development dependencies.
+#
+# Runtime dependencies live in requirements.txt and are unchanged by the test
+# infrastructure. Install both for a development environment:
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest==9.1.1
+pytest-django==4.14.0
+# Supplies the environment variables settings.py requires (see pytest.ini) early
+# enough for pytest-django to configure Django, so tests need no .env file.
+pytest-env==1.7.0
