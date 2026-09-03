@@ -24,13 +24,15 @@ export function ToastHost() {
   const handleShow = useCallback(
     (nextMessage: string) => {
       setMessage(nextMessage);
-      opacity.value = withSequence(
-        withTiming(1, { duration: 200, easing: Easing.out(Easing.cubic) }),
-        withDelay(
-          VISIBLE_DURATION,
-          withTiming(0, { duration: 250 }, (finished) => {
-            if (finished) runOnJS(setMessage)(null);
-          })
+      opacity.set(
+        withSequence(
+          withTiming(1, { duration: 200, easing: Easing.out(Easing.cubic) }),
+          withDelay(
+            VISIBLE_DURATION,
+            withTiming(0, { duration: 250 }, (finished) => {
+              if (finished) runOnJS(setMessage)(null);
+            })
+          )
         )
       );
     },
@@ -39,7 +41,7 @@ export function ToastHost() {
 
   useToastListener(handleShow);
 
-  const animatedStyle = useAnimatedStyle(() => ({ opacity: opacity.value }));
+  const animatedStyle = useAnimatedStyle(() => ({ opacity: opacity.get() }));
 
   if (!message) return null;
 
@@ -56,7 +58,7 @@ export function ToastHost() {
 
 const styles = StyleSheet.create({
   wrapper: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     alignItems: 'center',
     justifyContent: 'flex-end',
     paddingBottom: Spacing.six,

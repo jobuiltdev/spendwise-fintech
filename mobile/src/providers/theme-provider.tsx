@@ -34,7 +34,8 @@ export function ThemePreferenceProvider({ children }: PropsWithChildren) {
     void storage.setItem(THEME_PREFERENCE_KEY, next);
   };
 
-  const colorScheme: ColorScheme = preference === 'system' ? (systemScheme ?? 'light') : preference;
+  const colorScheme: ColorScheme =
+    preference === 'system' ? (systemScheme === 'dark' ? 'dark' : 'light') : preference;
 
   const value = useMemo(
     () => ({ preference, colorScheme, setPreference }),
