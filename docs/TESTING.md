@@ -39,7 +39,7 @@ Tests live with the code they cover:
 | Location | For |
 |---|---|
 | `backend/<app>/tests.py` or `backend/<app>/tests/` | Tests for a Django app |
-| `backend/tests/` | Project-level and infrastructure tests |
+| `backend/tests/` | Project-level, infrastructure, and cross-cutting characterization tests (`test_<area>.py`), with shared fixtures in `backend/tests/conftest.py` |
 
 Discovery picks up both `test_*.py` and Django's conventional `tests.py`, so
 existing per-app `tests.py` files are collected without being moved.
@@ -90,7 +90,21 @@ automatically here, so the entry is required.
 
 ## Scope
 
-Only smoke tests exist today (`backend/tests/test_infrastructure.py`,
-`mobile/src/__tests__/infrastructure.test.ts`). They prove discovery,
-transformation, and configuration work — they assert nothing about product
-behaviour. Behaviour tests come later.
+Two kinds of test exist today.
+
+**Infrastructure smoke tests** (`backend/tests/test_infrastructure.py`,
+`mobile/src/__tests__/infrastructure.test.ts`) prove discovery, transformation,
+and configuration work. They assert nothing about product behaviour.
+
+**Characterization tests** describe how SpendWise behaves *today*, so the
+fintech evolution changes things deliberately rather than by accident. They
+cover the areas marked KEEP or ADAPT — auth and session handling, manual
+expenses, categories, budgets, recurring schedules, group split and balance
+maths, ownership boundaries, the API client's token-refresh behaviour, and the
+reusable client-side utilities and form schemas.
+
+They deliberately do **not** pin behaviour that the fintech source of truth
+marks for removal or replacement. Where current behaviour conflicts with that
+spec, the conflict is documented in the test's docstring rather than frozen by
+an assertion; where a genuine bug was found, it is marked `xfail` with the
+correct behaviour asserted, so the marker fails loudly once the bug is fixed.
