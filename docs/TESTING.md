@@ -24,6 +24,23 @@ venv/Scripts/python -m pip install -r requirements.txt -r requirements-dev.txt
 |---|---|
 | `venv/Scripts/python -m pytest` | Run the test suite |
 | `venv/Scripts/python manage.py check` | Django system check |
+| `venv/Scripts/python manage.py makemigrations --check --dry-run` | Fail if models and migrations have drifted |
+
+### Running against PostgreSQL
+
+The suite must pass on both engines. SQLite is the default; PostgreSQL is opt-in
+through `DATABASE_URL`.
+
+```bash
+docker compose up -d db             # PostgreSQL 17, host port 55433
+cd backend
+DATABASE_URL=postgres://spendwise:spendwise@localhost:55433/spendwise \
+  venv/Scripts/python -m pytest
+```
+
+The host port is 55433 so the container can coexist with any PostgreSQL already
+bound to 5432. Those credentials are throwaway local values; they say nothing
+about production hosting, which is still an open decision.
 
 Tests need **no `.env` file**. `pytest.ini` supplies default values for the
 environment variables `settings.py` requires, using pytest-env's `D:` (default)
@@ -108,3 +125,18 @@ marks for removal or replacement. Where current behaviour conflicts with that
 spec, the conflict is documented in the test's docstring rather than frozen by
 an assertion; where a genuine bug was found, it is marked `xfail` with the
 correct behaviour asserted, so the marker fails loudly once the bug is fixed.
+
+**Foundation tests (M0)** cover the seams the financial core will be built on:
+the `Money` value type and its rejection of floats
+(`backend/moneycore/tests/`), the domain-error hierarchy and its HTTP mapping,
+the money-core module boundary staying free of schema, correlation ids, database
+configuration, and — importantly — proof that none of it changed a legacy API
+response (`backend/tests/test_m0_*.py`).
+
+## CI
+
+`.github/workflows/ci.yml` runs every gate above on each push and pull request:
+the backend suite, Django system check and migration-drift check on **both
+SQLite and PostgreSQL**, and the mobile suite, TypeScript, lint and expo-doctor.
+Lint fails the build on errors only — the repository's 8 pre-existing warnings
+are deliberately left in place.

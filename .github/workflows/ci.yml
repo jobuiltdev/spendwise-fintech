@@ -1,0 +1,107 @@
+name: CI
+
+# Runs the quality gates that already guard the repository. No deployment.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend (${{ matrix.database }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No DATABASE_URL: exercises the SQLite fallback developers get by default.
+          - database: sqlite
+            database_url: ''
+          # Same major PostgreSQL version as docker-compose.yml.
+          - database: postgresql
+            database_url: 'postgres://spendwise:spendwise@localhost:5432/spendwise'
+
+    services:
+      postgres:
+        # Only consumed by the postgresql matrix leg; idle on the sqlite leg.
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: spendwise
+          POSTGRES_USER: spendwise
+          POSTGRES_PASSWORD: spendwise
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U spendwise -d spendwise"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: ${{ matrix.database_url }}
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Django 4.2 does not support Python 3.13+.
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # pytest.ini supplies the environment variables settings.py requires, so
+      # no .env file is needed here.
+      - name: Django system check
+        run: python manage.py check
+
+      - name: Migration drift check
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Tests
+        run: python -m pytest
+
+  mobile:
+    name: Mobile
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: mobile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Tests
+        run: npm test -- --runInBand
+
+      - name: TypeScript
+        run: npx tsc --noEmit
+
+      # The repository's baseline is 0 errors and 8 known warnings. This fails
+      # on errors only; the warnings are pre-existing and deliberately untouched.
+      - name: Lint
+        run: npm run lint
+
+      - name: Expo doctor
+        run: npx expo-doctor

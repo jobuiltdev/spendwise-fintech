@@ -1,0 +1,39 @@
+# Local development and CI database.
+#
+# This is a LOCAL/CI convenience only. It does not decide production database
+# hosting, which remains an open decision (see the architecture document).
+#
+#   docker compose up -d db
+#   DATABASE_URL=postgres://spendwise:spendwise@localhost:55433/spendwise \
+#     backend/venv/Scripts/python -m pytest
+#
+# The host port is 55433 rather than the default 5432 so this stack can run
+# alongside any other PostgreSQL already bound to 5432 on a developer machine.
+# Inside the container the port is still 5432, so CI (which reaches the service
+# over the runner network) is unaffected.
+#
+# Credentials here are deliberately throwaway local values with no production
+# meaning. Never put real credentials in this file.
+
+services:
+  db:
+    # Pinned to the PostgreSQL 17 alpine line for local/CI reproducibility.
+    # CI runs the same major version.
+    image: postgres:17-alpine
+    container_name: spendwise-postgres
+    environment:
+      POSTGRES_DB: spendwise
+      POSTGRES_USER: spendwise
+      POSTGRES_PASSWORD: spendwise
+    ports:
+      - '55433:5432'
+    volumes:
+      - spendwise-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U spendwise -d spendwise']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  spendwise-postgres-data:

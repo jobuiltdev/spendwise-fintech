@@ -58,6 +58,10 @@ INSTALLED_APPS = [
     'analytics',
     'recurring',
 
+    # Financial core. Registered from M0 as an intentionally empty boundary:
+    # it has no models and contributes no migration.
+    'moneycore',
+
     # third party apps
     'rest_framework',
     'django_filters',
@@ -67,6 +71,9 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # First, so every request carries a correlation id before anything else can
+    # log or fail. See spendwise/correlation.py.
+    'spendwise.correlation.CorrelationIdMiddleware',
     'django.middleware.security.SecurityMiddleware',
     # Needs to sit above CommonMiddleware/CsrfViewMiddleware so it can attach
     # CORS headers before any response is generated.
@@ -102,13 +109,24 @@ WSGI_APPLICATION = 'spendwise.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
-
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+#
+# DATABASE_URL drives the connection when it is set, e.g.
+#   postgres://spendwise:spendwise@localhost:55433/spendwise
+# (docker-compose.yml brings up a matching local PostgreSQL — see docs/TESTING.md).
+#
+# With DATABASE_URL unset, the configuration is byte-for-byte the SQLite setup
+# the project has always used, so existing local development keeps working with
+# no PostgreSQL installed and nothing new to configure. The branch is explicit
+# rather than a parsed default URL precisely so that fallback cannot drift.
+if env('DATABASE_URL', default=''):
+    DATABASES = {'default': env.db_url('DATABASE_URL')}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
 
 
 # Password validation
@@ -183,6 +201,9 @@ REST_FRAMEWORK = {
     'PAGE_SIZE': 20,
     'DATE_FORMAT': '%Y-%m-%d',
     'DATETIME_FORMAT': '%Y-%m-%d %H:%M:%S',
+    # Renders moneycore DomainErrors; every other exception is passed straight
+    # to DRF's own handler, so legacy endpoints are unaffected.
+    'EXCEPTION_HANDLER': 'moneycore.api.exception_handler.domain_exception_handler',
 }
 
 # JWT auth
@@ -196,4 +217,36 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,
     'UPDATE_LAST_LOGIN': True,
     'AUTH_HEADER_TYPES': ('Bearer',),
+}
+
+
+# Logging
+# Adds a correlation id to log records so a line can be traced back to the
+# request that produced it. `disable_existing_loggers` is False and Django's own
+# loggers are left alone, so this only adds output for project code.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'filters': {
+        'correlation_id': {
+            '()': 'spendwise.correlation.CorrelationIdFilter',
+        },
+    },
+    'formatters': {
+        'with_correlation_id': {
+            'format': '[{levelname}] [{correlation_id}] {name}: {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'filters': ['correlation_id'],
+            'formatter': 'with_correlation_id',
+        },
+    },
+    'loggers': {
+        'spendwise': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+        'moneycore': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+    },
 }

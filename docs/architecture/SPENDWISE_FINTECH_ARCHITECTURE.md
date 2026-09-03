@@ -625,6 +625,32 @@ Implementation → tests → full suite → migration checks → static analysis
 
 ---
 
+## 17A. Decisions closed in M0 — LOCAL/CI IMPLEMENTATION DECISIONS
+
+These were settled while building the M0 foundation. Every one is a
+**local and CI** decision. **None of them decides anything about production**,
+and none closes an item in §18.
+
+| # | Decision | Detail |
+|---|---|---|
+| M0-1 | **Database configuration is environment-driven** | `DATABASE_URL` selects the database. When it is unset, the configuration is the historical SQLite file verbatim, so existing local development needs nothing installed. The fallback is an explicit branch in `settings.py` rather than a parsed default URL, so it cannot drift. |
+| M0-2 | **Local/CI PostgreSQL version: 17** | `postgres:17-alpine` in `docker-compose.yml` (verified server_version 17.10) and the same major version in CI. Host port **55433** so the container coexists with any PostgreSQL already on 5432. Local credentials are throwaway. **This does not choose a production database, host, or managed service.** |
+| M0-3 | **PostgreSQL driver: psycopg 3** | `psycopg[binary]==3.3.5`, the maintained driver Django 4.2 supports. Loaded only when `DATABASE_URL` points at PostgreSQL. |
+| M0-4 | **The money core is one Django app: `moneycore`** | A modular monolith gets one intentional boundary, not several speculative ones. It has no `models.py` and no `migrations/`, so it contributes no schema; a test asserts both. Domain code lives in `moneycore/domain/`, API adapters in `moneycore/api/`. |
+| M0-5 | **Authoritative money representation: integer minor units + ISO-4217 code** | `moneycore.domain.money.Money` is a frozen dataclass. Floats, `Decimal`, strings and `bool` are rejected at construction; cross-currency arithmetic raises. It is unused by the existing tracker, whose `Expense.amount` stays a `Decimal` field. Rounding policy, allocation of remainders, formatting and persistence are **not** decided here. |
+| M0-6 | **Domain-error structure for new code** | `moneycore.domain.errors.DomainError` and subclasses carry a stable `code`, a safe `message`, optional `details`, and an explicit HTTP status (400/403/404/409/422/502). Rendered as `{"error": {code, message, details?, correlation_id?}}` by a DRF handler that passes every non-domain exception to DRF untouched. **Legacy endpoint error shapes are unchanged** and are not migrated. |
+| M0-7 | **Correlation ids** | `X-Correlation-ID` on every request and response. An inbound id is echoed only when it matches `^[A-Za-z0-9-]{8,64}$`; anything else is replaced with a fresh UUID4, which carries no user, host or timing information. Held in a `ContextVar` so domain code and the error handler can read it, and available to logging as `%(correlation_id)s`. Not distributed tracing. |
+| M0-8 | **CI gates** | `.github/workflows/ci.yml` runs the backend suite, system check and migration-drift check on **both** engines, plus the mobile suite, TypeScript, lint and expo-doctor. No deployment. |
+
+### What M0 deliberately did not build
+
+Celery, Redis, the transactional outbox, an event bus, idempotency keys, storage
+abstraction, and every financial model (account, wallet, ledger, journal entry,
+holds, transfers, providers). Each belongs to the milestone that needs it, and
+building any of them against imagined requirements would guarantee rework.
+
+---
+
 ## 18. Deferred and open register
 
 **DEFERRED** — awaiting investor, provider, or compliance input:
@@ -648,6 +674,9 @@ Implementation → tests → full suite → migration checks → static analysis
 | # | Item | Section |
 |---|---|---|
 | O-1 | Persistence representation of manual expense vs financial transaction | §6.3 |
+| O-5 | Rounding mode, allocation of remainders, and the display precision of `Money` — M0 fixed the representation only | §17A M0-5 |
+| O-6 | Client-side handling of the new `{"error": {...}}` object shape, which differs from the legacy `{"error": "<string>"}` the mobile helper expects | §17A M0-6 |
+| O-7 | Whether legacy `TextField`-as-JSON columns move to `JSONField` now that PostgreSQL is available | §4.1 |
 | O-2 | Rounding mode and remainder allocation for authoritative money | §7 |
 | O-3 | Reports' eventual placement | §12 |
 | O-4 | Whether NativeTabs can achieve the target glass treatment on the pinned Expo version | §13.1 |
