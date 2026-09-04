@@ -24,23 +24,25 @@ def _backend_root():
     return Path(moneycore.__file__).resolve().parents[1]
 
 
-class TestNoM4OrLaterConcepts:
-    """Transfers, transactions and providers are later milestones.
+class TestNoM5OrLaterConcepts:
+    """Transfers, recipients and providers are later milestones.
 
-    M2 wrote these to exclude holds as well; M3 introduced holds deliberately,
-    so the hold entity is now expected and the guard has moved forward to M4.
+    M2 wrote these to exclude holds and transactions as well; M3 introduced the
+    hold and M4 the financial transaction, deliberately, so both entities are
+    now expected and the guard has moved forward to M5.
     """
 
-    def test_the_app_declares_exactly_the_models_through_m3(self):
+    def test_the_app_declares_exactly_the_models_through_m4(self):
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
 
         assert declared == {
             'FinancialCustomer', 'FinancialAccount', 'Wallet',
             'LedgerAccount', 'Journal', 'JournalEntry',
             'FundsHold',
+            'FinancialTransaction',
         }
 
-    def test_no_m4_or_later_model_exists(self):
+    def test_no_m5_or_later_model_exists(self):
         declared = {
             m.__name__.lower() for m in apps.get_app_config('moneycore').get_models()
         }

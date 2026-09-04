@@ -217,14 +217,36 @@ class TestNoReservationDuplicateConcept:
         assert 'reservation' not in declared
         assert 'hold' not in declared  # no second, duplicate concept
 
-    def test_the_hold_has_no_transaction_or_provider_reference(self):
-        names = {f.name for f in FundsHold._meta.get_fields()}
+    def test_the_hold_table_stores_no_transaction_or_provider_reference(self):
+        """M3 asserted this across every field; M4 narrows it to real columns.
 
-        assert names.isdisjoint({
+        M4 added ``FinancialTransaction.hold``, so a *reverse* accessor named
+        ``transaction`` now exists on the hold. The column lives on the
+        transaction, which is the direction that matters: a hold still knows
+        nothing about what it funds, and reserving funds remains meaningful on
+        its own.
+        """
+        columns = {f.name for f in FundsHold._meta.concrete_fields}
+
+        assert columns.isdisjoint({
             'transaction', 'transaction_id', 'transfer', 'transfer_id',
             'provider', 'provider_id', 'provider_reference', 'recipient',
             'account_number',
         })
+
+    def test_the_reverse_transaction_link_is_the_only_one_added(self):
+        reverse = {
+            f.name
+            for f in FundsHold._meta.get_fields()
+            if f.auto_created and not f.concrete
+        }
+
+        assert reverse == {'transaction'}
+
+    def test_a_hold_funds_at_most_one_transaction(self):
+        field = FundsHold._meta.get_field('transaction')
+
+        assert field.one_to_one
 
     def test_the_hold_has_no_relation_to_a_legacy_expense(self):
         related = {
@@ -233,4 +255,5 @@ class TestNoReservationDuplicateConcept:
             if f.related_model is not None
         }
 
-        assert related == {'Wallet'}
+        assert related == {'Wallet', 'FinancialTransaction'}
+        assert 'Expense' not in related

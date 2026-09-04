@@ -368,3 +368,128 @@ class LedgerPostingConflictsWithHoldsError(LedgerError):
         'This posting would leave less posted balance than is currently '
         'reserved on the wallet.'
     )
+
+
+# ---------------------------------------------------------------------------
+# M4: the transaction engine
+# ---------------------------------------------------------------------------
+# Internal domain errors. Transactions have no customer-facing surface in M4.
+
+
+class TransactionError(DomainError):
+    """Base for transaction faults, so callers can catch the whole family."""
+
+    code = 'transaction_error'
+    http_status = 409
+    default_message = 'The transaction operation could not be completed.'
+
+
+class TransactionNotFoundError(TransactionError):
+    """No transaction matches the reference given."""
+
+    code = 'transaction_not_found'
+    http_status = 404
+    default_message = 'No such transaction.'
+
+
+class InvalidTransactionAmountError(TransactionError):
+    """The amount is not a usable positive integer minor-unit value."""
+
+    code = 'invalid_transaction_amount'
+    http_status = 400
+    default_message = (
+        'A transaction amount must be a positive whole number of minor units.'
+    )
+
+
+class InvalidTransactionDirectionError(TransactionError):
+    """The direction is not one this engine recognises."""
+
+    code = 'invalid_transaction_direction'
+    http_status = 400
+    default_message = 'That is not a transaction direction.'
+
+
+class TransactionCurrencyMismatchError(TransactionError):
+    """The transaction currency disagrees with its wallet's."""
+
+    code = 'transaction_currency_mismatch'
+    default_message = 'A transaction must use the wallet currency.'
+
+
+class InvalidTransactionTransitionError(TransactionError):
+    """The requested lifecycle move is not legal from the current state."""
+
+    code = 'invalid_transaction_transition'
+    default_message = 'That transaction status change is not allowed.'
+
+
+class TransactionAlreadyResolvedError(TransactionError):
+    """The transaction has reached a terminal state and will not move again.
+
+    Distinct from a plain illegal transition: this says the outcome is already
+    settled, which is what a second concurrent resolver needs to be told.
+    """
+
+    code = 'transaction_already_resolved'
+    default_message = 'That transaction has already been resolved.'
+
+
+class TransactionHoldRequiredError(TransactionError):
+    """An outgoing transaction cannot start execution without reserved funds.
+
+    Beginning to send money that is not reserved would let the same funds be
+    spent twice.
+    """
+
+    code = 'transaction_hold_required'
+    http_status = 422
+    default_message = (
+        'An outgoing transaction needs an active reservation before it can start.'
+    )
+
+
+class TransactionHoldInvalidError(TransactionError):
+    """The hold cannot serve this transaction.
+
+    Wrong wallet, wrong currency, no longer effective, or already attached to
+    another transaction.
+    """
+
+    code = 'transaction_hold_invalid'
+    http_status = 422
+    default_message = 'That reservation cannot be used for this transaction.'
+
+
+class TransactionIdempotencyConflictError(TransactionError):
+    """The key was reused with a different intent.
+
+    Returning the original transaction would silently ignore what the caller
+    actually asked for, so this is refused instead.
+    """
+
+    code = 'transaction_idempotency_conflict'
+    default_message = (
+        'That idempotency key was already used for a different transaction.'
+    )
+
+
+class TransactionSuccessRequiresJournalError(TransactionError):
+    """Success must correspond to posted financial truth.
+
+    A transaction cannot be marked succeeded without a posted journal recording
+    what actually moved.
+    """
+
+    code = 'transaction_success_requires_journal'
+    default_message = 'A successful transaction must have a posted journal.'
+
+
+class TransactionIntentImmutableError(TransactionError):
+    """An attempt was made to rewrite a transaction's settled intent."""
+
+    code = 'transaction_intent_immutable'
+    default_message = (
+        'A transaction\'s wallet, direction, amount, currency and idempotency '
+        'key cannot be changed after creation.'
+    )

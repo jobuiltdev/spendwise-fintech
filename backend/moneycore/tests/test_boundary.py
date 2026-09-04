@@ -21,26 +21,29 @@ class TestAppRegistration:
 
 
 class TestSchemaMatchesTheCurrentMilestone:
-    """M0 asserted no models; M1 asserted its three; M2 adds the ledger.
+    """M0 asserted no models; M1 its three; M2 the ledger; M3 the hold.
 
     Each milestone supersedes the last deliberately, and the assertion stays
-    tight rather than becoming loose: the app holds exactly the M1 and M2
-    entities, so anything from M3 onward — a hold, a transfer, a transaction —
+    tight rather than becoming loose: the app holds exactly the entities through
+    M4, so anything from M5 onward — a transfer, a recipient, a provider —
     fails the build the moment it appears.
     """
 
     M1_MODELS = {'FinancialCustomer', 'FinancialAccount', 'Wallet'}
     M2_MODELS = {'LedgerAccount', 'Journal', 'JournalEntry'}
     M3_MODELS = {'FundsHold'}
+    M4_MODELS = {'FinancialTransaction'}
 
-    def test_the_app_declares_exactly_the_models_through_m3(self):
+    def test_the_app_declares_exactly_the_models_through_m4(self):
         declared = {
             model.__name__ for model in apps.get_app_config('moneycore').get_models()
         }
 
-        assert declared == self.M1_MODELS | self.M2_MODELS | self.M3_MODELS
+        assert declared == (
+            self.M1_MODELS | self.M2_MODELS | self.M3_MODELS | self.M4_MODELS
+        )
 
-    def test_no_m4_or_later_model_has_appeared(self):
+    def test_no_m5_or_later_model_has_appeared(self):
         declared = {
             model.__name__.lower()
             for model in apps.get_app_config('moneycore').get_models()
@@ -50,6 +53,7 @@ class TestSchemaMatchesTheCurrentMilestone:
             'availablebalance', 'transaction', 'transfer', 'recipient',
             'beneficiary', 'provider', 'webhook', 'reconciliation', 'fee',
             'settlement', 'idempotencykey', 'outboxmessage',
+            'transferrequest', 'payout', 'paymentattempt', 'providerattempt',
         }
 
         assert declared.isdisjoint(forbidden)
@@ -64,7 +68,7 @@ class TestSchemaMatchesTheCurrentMilestone:
         applied = sorted(
             path.stem for path in migrations_dir.glob('*.py') if path.stem != '__init__'
         )
-        assert len(applied) == 3
+        assert len(applied) == 4
         assert applied[0] == '0001_initial'
 
     def test_the_m1_migration_was_not_rewritten(self):
@@ -75,11 +79,12 @@ class TestSchemaMatchesTheCurrentMilestone:
         migrations_dir = Path(find_spec('moneycore.migrations').origin).parent
         initial = (migrations_dir / '0001_initial.py').read_text(encoding='utf-8')
 
-        # The ledger and holds arrived in later migrations, never by editing
-        # this one.
+        # The ledger, holds and transactions arrived in later migrations, never
+        # by editing this one.
         assert 'LedgerAccount' not in initial
         assert 'Journal' not in initial
         assert 'FundsHold' not in initial
+        assert 'FinancialTransaction' not in initial
 
     def test_the_m2_migration_was_not_rewritten(self):
         """Committed migration history stays append-only."""
@@ -90,6 +95,17 @@ class TestSchemaMatchesTheCurrentMilestone:
         ledger = next(migrations_dir.glob('0002_*.py')).read_text(encoding='utf-8')
 
         assert 'FundsHold' not in ledger
+        assert 'FinancialTransaction' not in ledger
+
+    def test_the_m3_migration_was_not_rewritten(self):
+        """Committed migration history stays append-only."""
+        from importlib.util import find_spec
+        from pathlib import Path
+
+        migrations_dir = Path(find_spec('moneycore.migrations').origin).parent
+        holds = next(migrations_dir.glob('0003_*.py')).read_text(encoding='utf-8')
+
+        assert 'FinancialTransaction' not in holds
 
 
 class TestDomainImports:

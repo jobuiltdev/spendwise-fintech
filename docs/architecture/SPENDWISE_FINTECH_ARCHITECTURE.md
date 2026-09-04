@@ -356,6 +356,13 @@ disabled", along with `Draft`, `Submitted`, `Cancelled`, and `Returned` transfer
 states. **All of that is withdrawn.** The approved customer-facing transfer states
 are those in §8.1–§8.2.
 
+**M4 follows this section as written.** `FinancialTransaction` has **no
+cancellation state and no abandonment transition of any name** — not in the
+domain, not in the API, not in the UI. Backing out before execution is accepted
+produces no financial transaction at all, so there is nothing to cancel. If
+persisted drafts are ever required they belong to the transfer/product layer,
+outside the money transaction engine, and **M5 must preserve that separation**.
+
 ### 8.6 Balance terminology — LOCKED
 
 Customer-facing terms are exactly:
@@ -763,6 +770,58 @@ cooldown rules, Celery, Redis, an outbox, an idempotency-key framework,
 scheduled hold cleanup, capture or settlement orchestration, and any UI. No
 legacy `Expense` gained a hold, and no hold references one.
 
+## 17E. Decisions closed in M4 — the transaction engine
+
+M4 answers a third question, kept strictly apart from the first two: *what
+operation is happening, and what does SpendWise authoritatively know about it?*
+The ledger still owns what money exists (M2) and the hold still owns what posted
+money is reserved (M3). A transaction owns neither; it owns state.
+
+The single most consequential decision in this milestone is that **UNKNOWN is a
+first-class, persisted, non-terminal state**. Everything else follows from
+refusing to let an absent answer be recorded as a failure.
+
+| # | Decision | Detail |
+|---|---|---|
+| M4-1 | **Three concepts, three modules, no blending** | Ledger = what posted. Hold = what is reserved. Transaction = what is being attempted. A transaction carries no accounting entries of its own, and neither the ledger nor the hold gained a transaction column. The only structural link is on the transaction side: `FinancialTransaction.hold` and `FinancialTransaction.journal`, both `OneToOne`. |
+| M4-2 | **Direction is two-valued: `outgoing` / `incoming`** | Whether money leaves or enters the wallet is all the engine needs. Card payment, refund, cash-out, fee and the rest are *operation types* — what kind of thing is being done — which is M5's vocabulary. No `TransactionType`, `OperationType` or `TransferType` exists, asserted by test. |
+| M4-3 | **Five states: `created`, `processing`, `unknown`, `succeeded`, `failed`** | `TERMINAL = {succeeded, failed}`. **`unknown` is deliberately absent from that set**: it is unresolved, not concluded. `EXECUTION_MAY_HAVE_STARTED = {processing, unknown}` names the states where the operation might already have happened externally. There is no cancellation or draft state — see M4-12. |
+| M4-4 | **The transition table is explicit, closed, and rejects self-transitions** | `created → {processing, failed}`; `processing → {succeeded, failed, unknown}`; `unknown → {succeeded, failed}`; the two terminals go nowhere. `created → failed` is reserved for an **authoritative known pre-execution failure** — a check that genuinely failed — and is not an abandonment route. Re-marking a `processing` transaction as `processing` is a caller mistake surfaced as `invalid_transaction_transition`, not a silent success. |
+| M4-5 | **There is no path from ambiguity to failure** | `unknown → failed` exists only as an *authoritative* conclusion — someone established that nothing moved. Nothing in the engine converts a timeout, an absent response or an ambiguous one into `failed`; that is `mark_unknown`. This is the rule §8.2 and §8.4 describe, implemented as a state machine rather than a convention. |
+| M4-6 | **`unknown → processing` does not exist** | "Try again" from ambiguity would discard the fact that an execution may already have happened, which is exactly how the same money gets sent twice. Resolution moves forward to an authoritative answer or it waits. |
+| M4-7 | **`mark_unknown` changes nothing except the state — and the hold stays active** | No journal, no release, no balance movement. Keeping the reservation is the point: the funds stay unavailable while SpendWise works out what happened, so the customer cannot spend money that may already have left. The state is a database column, so it survives any process, worker or app restart. |
+| M4-8 | **Success releases the reservation and posts the journal in ONE atomic block, release first** | This ordering is not incidental. While a hold is active, M3's posting guard (M3-10) correctly refuses a journal that would take the wallet below its reserved funds — so an active hold blocks the very posting it exists to enable. Releasing in a separately committed step instead would leave a window in which the funds are neither reserved nor spent, and briefly spendable twice. Both happen inside one `transaction.atomic`: either both land or neither does. A test proves the same entries are refused through `post_journal` while the hold is active, and accepted through `succeed_transaction`. |
+| M4-9 | **Success accepts prepared entries; the engine invents no ledger accounts** | `succeed_transaction(txn, *, entries, …)` posts what the calling domain supplies. M4 does not know what a transfer is, so deciding which accounts one debits and credits would put transfer knowledge in the wrong milestone. `LedgerAccountType`, `open_ledger_account` and `open_wallet_ledger_account` do not appear in the service, asserted by test. M5 supplies transfer accounting. |
+| M4-10 | **"Succeeded" and "has posted truth" are the same fact, enforced by the database** | A check constraint requires `status = succeeded ⟺ journal IS NOT NULL`: no transaction may claim success without a posted journal, and no non-succeeded transaction may carry one. A second constraint requires `terminal ⟺ resolved_at IS NOT NULL`. These are database constraints, not service conventions. |
+| M4-11 | **Known failure releases the reservation in the same transaction** | Nothing moved, so nothing may stay reserved. A transaction cannot end `failed` with the customer's money still locked away. This is the *only* pre-execution exit, and it is authoritative — it records that a check genuinely failed, not that someone changed their mind. |
+| M4-12 | **There is no cancellation, from any state** | This follows the locked §8.5 rather than reinterpreting it. `CANCELLED`, the `created → cancelled` transition and `cancel_transaction()` do not exist — the status check constraint rejects `cancelled` at the database level, and a test asserts no cancellation vocabulary survives anywhere in the money core. **A `FinancialTransaction` is not a persisted draft or an abandoned UI flow**: backing out before execution is accepted produces no financial transaction at all. Pre-execution product drafts, if ever required, belong to the future transfer/product layer, and **M5 must preserve that separation**. No replacement state was added in cancellation's place. |
+| M4-13 | **Starting an outgoing operation requires an *effectively active* reservation** | `start_processing` refuses without a hold (`transaction_hold_required`) and refuses an expired one (`transaction_hold_invalid`), using M3's read-time expiry predicate rather than a stored flag. **M4 neither renews nor extends a reservation** — how long one should live is O-17, still open — so an expired hold is a refusal, never something to quietly repair. Incoming transactions reserve nothing. |
+| M4-14 | **A hold's amount is not required to equal the transaction's** | A reservation may legitimately cover more than the principal; fees are the obvious future case. M4 has no business inventing that arithmetic, so it validates wallet and currency and stops there. |
+| M4-15 | **One reservation funds at most one operation** | `hold` is a `OneToOne`, so two transactions can never spend the same reserved money — enforced by the database and proved under a real concurrent race. `journal` is likewise `OneToOne`: one posted journal certifies at most one success. |
+| M4-16 | **Idempotency is scoped to `(wallet, idempotency_key)` and is intent-level only** | The same key with the same intent returns the existing transaction; the same key with a *different* intent raises `transaction_idempotency_conflict` rather than quietly ignoring what was asked for. Scoped per wallet so two customers cannot collide. This is **not** a general idempotency framework and says nothing about provider idempotency (M6) or webhook replay (M7). |
+| M4-17 | **Concurrent creation rests on the unique constraint, not a read-then-write check** | Both callers attempt the insert; one wins, the loser catches the integrity error inside a savepoint and returns the winner's row. Exactly one transaction exists either way — proved with eight simultaneous callers on PostgreSQL. |
+| M4-18 | **Lock order: wallets (ascending PK) → transaction row → hold → ledger posting → transaction update** | M4 introduces no second ordering. It reuses M2/M3's rule that the `Wallet` row is the serialisation gate for everything affecting spendability, and reuses M2's ascending-primary-key helper for multiple wallets. **No path in the codebase takes a transaction or hold lock before a wallet lock**, which is what keeps M4 from introducing a deadlock cycle. Success also locks every wallet named by the supplied entries, so the locks it holds already cover everything `post_journal` will touch. |
+| M4-19 | **Every status change goes through the service** | Nothing assigns `transaction.status` directly, no serializer orchestrates a transition, and no signal is involved. Model `save()` refuses to alter intent (`wallet`, `direction`, `amount_minor`, `currency`, `idempotency_key`) as a backstop, not as the supported path. |
+| M4-20 | **Transactions are permanent history and are never deleted** | `delete()` is refused at model and queryset level; bulk `update()` is refused when resolved rows are in scope. |
+| M4-21 | **Amounts are positive 64-bit integer minor units** | Identical to M2 and M3: `BigIntegerField`, `amount_minor > 0` check constraint, no float, no `Decimal`, no negative-amount convention, no zero-value transaction, no rounding. Direction carries the sign; the number never does. |
+| M4-22 | **`failure_code` is a normalised internal code, and nothing else is stored** | `CharField(max_length=64)`. No provider text, payload, status string, response body, stack trace or credential is stored anywhere on the transaction. The code vocabulary itself is M6's to define when provider errors are first mapped. |
+| M4-23 | **No provider, no network, no scheduler, no signals, no API, no mobile** | The money core imports no HTTP client. No provider vocabulary appears in the transaction modules. No transaction, transfer or payment route is registered, and the M1 `GET /api/financial-account/` response is unchanged and still balance-free — verified with a live `processing` transaction and an active hold. No dependency was added. No mobile file was touched. |
+| M4-24 | **"Confirming" is product wording and never appears in the backend** | `unknown` is the stored state; §8.2's `Confirming` is how it is expressed to a customer, and §8.6's "Being confirmed" is how reserved funds may be shown. Neither string exists in the domain, the model or the service. |
+| M4-25 | **Still no stored balance, anywhere** | M4 added no `balance`, `available_balance`, `held_balance` or `reserved_balance` column to any model. `posted / held / available` remain derived (M3-5). |
+| M4-26 | **Migration `0004` is purely additive; `0001`–`0003` are byte-unchanged** | Verified forward, reversed to `0003`, and re-applied on PostgreSQL. Tests assert the app has exactly four migrations and that no earlier one mentions `FinancialTransaction`. |
+| M4-27 | **M3's hold-schema assertion is narrowed, not weakened** | M3 asserted that no field on `FundsHold` names a transaction. `FinancialTransaction.hold` gives the hold a *reverse* accessor, so the assertion now covers **concrete columns**: the hold table still stores no transaction reference. The column lives on the transaction, which is the direction that matters — a hold knows nothing about what it funds, and reserving funds remains meaningful on its own. New assertions pin the reverse link to exactly one relation, and require it to be one-to-one. |
+
+### What M4 deliberately did not build
+
+Transfers, recipients, bank details, an operation-type taxonomy, a cancellation
+or abandonment state, a persisted transfer draft, provider abstraction, a
+provider simulator, a transfer simulator, retry or resubmission logic, an
+UNKNOWN resolver or reconciliation job, webhooks, an outbox, a general
+idempotency framework, fee arithmetic, hold renewal or extension, settlement,
+KYC, risk, a transaction PIN, cooldown rules, Celery, Redis, any scheduler, any
+API endpoint, any serializer, any signal, any admin surface, and any UI. No
+legacy `Expense` gained a transaction, and no transaction references one.
+
 ---
 
 ## 18. Deferred and open register
@@ -804,7 +863,13 @@ legacy `Expense` gained a hold, and no hold references one.
 | O-18 | Whether a wallet may ever carry a negative posted balance (overdraft). M3 invents none and rejects holds against one | §17D M3-12 |
 | O-19 | Whether and when the posted/held/available projection is exposed to product surfaces, and in what shape | §17D M3-18 |
 | O-20 | Whether hold expiry ever gains a background sweeper. M3 needs none — correctness is read-time — so this is housekeeping preference, not correctness | §17D M3-4 |
-| O-21 | Whether hold release gains idempotent retry semantics, which would arrive with M4's idempotency keys | §17D M3-13 |
+| O-21 | Whether hold release gains idempotent retry semantics. **Narrowed by M4, not closed:** M4 introduced idempotency at the level of *transaction intent* only, and deliberately did not extend it to hold release, which still raises `hold_not_active` on a second call | §17D M3-13, §17E M4-16 |
+| O-22 | **How an UNKNOWN transaction is eventually resolved.** M4 makes the state safe, persistent and reservation-preserving, but nothing in M4 resolves one: whether resolution arrives by provider polling, webhook, reconciliation sweep or manual operations is M6/M7 | §17E M4-5, M4-7 |
+| O-23 | How long a transaction may remain UNKNOWN before operational escalation, and what that escalation is. M4 imposes no time limit — an unresolved operation stays unresolved rather than being concluded on a timer | §17E M4-5 |
+| O-24 | The `failure_code` vocabulary. M4 stores a normalised internal code but defines no values; provider errors are first mapped in M6 | §17E M4-22 |
+| O-25 | Whether a reservation may exceed the transaction principal in practice, and the fee arithmetic that would justify it. M4 permits the difference structurally and computes nothing | §17E M4-14 |
+| O-26 | Whether and how transaction state is exposed to product surfaces, and what shape that takes. M4 exposes none | §17E M4-23 |
+| O-27 | The fresh-intent policy for a new operation after a terminal failure — whether the product generates a fresh idempotency key or requires the caller to. `FAILED` is terminal and remains historical; M4 requires a new key for a genuinely new attempt, which is what stops a retry loop from spending twice, and **invents no retry semantics of its own**. M5 defines the policy | §17E M4-16 |
 | O-2 | Rounding mode and remainder allocation for authoritative money | §7 |
 | O-3 | Reports' eventual placement | §12 |
 | O-4 | Whether NativeTabs can achieve the target glass treatment on the pinned Expo version | §13.1 |

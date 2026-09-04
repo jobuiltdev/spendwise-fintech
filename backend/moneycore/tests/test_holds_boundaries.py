@@ -1,7 +1,7 @@
 """What M3 must NOT have introduced. Groups H and I.
 
 The ledger stays untouched by hold lifecycle, the legacy tracker stays separate,
-and no M4+ concept crept in.
+and no M5+ concept crept in (M4's transaction is now expected).
 """
 
 import pytest
@@ -159,17 +159,22 @@ class TestLegacyExpenseRemainsSeparate:
 # ---------------------------------------------------------------------------
 
 
-class TestNoM4OrLaterConcepts:
-    def test_the_app_declares_exactly_the_m1_m2_and_m3_models(self):
+class TestNoM5OrLaterConcepts:
+    """M3 wrote this to exclude the transaction; M4 introduced it deliberately,
+    so the guard has moved forward to M5.
+    """
+
+    def test_the_app_declares_exactly_the_models_through_m4(self):
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
 
         assert declared == {
             'FinancialCustomer', 'FinancialAccount', 'Wallet',
             'LedgerAccount', 'Journal', 'JournalEntry',
             'FundsHold',
+            'FinancialTransaction',
         }
 
-    def test_no_m4_or_later_model_exists(self):
+    def test_no_m5_or_later_model_exists(self):
         declared = {
             m.__name__.lower() for m in apps.get_app_config('moneycore').get_models()
         }

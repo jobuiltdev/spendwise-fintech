@@ -38,8 +38,18 @@ from moneycore.domain.currency import (
 )
 from django.utils import timezone
 
-from moneycore.domain.errors import HoldImmutableError, JournalImmutableError
+from moneycore.domain.errors import (
+    HoldImmutableError,
+    JournalImmutableError,
+    TransactionIntentImmutableError,
+)
 from moneycore.domain.holds import HoldStatus, hold_is_terminal, is_effectively_active
+from moneycore.domain.transactions import (
+    TransactionDirection,
+    TransactionStatus,
+    execution_may_have_started,
+)
+from moneycore.domain.transactions import is_terminal as transaction_is_terminal
 from moneycore.domain.money import Money
 from moneycore.domain.ledger import (
     EntryDirection,
@@ -682,4 +692,221 @@ class FundsHold(models.Model):
         """Holds are operational history and are not deleted."""
         raise HoldImmutableError(
             'Holds are financial operational history and cannot be deleted.'
+        )
+
+
+# ===========================================================================
+# M4: the transaction engine
+# ===========================================================================
+# A transaction records what operation SpendWise is attempting and what it
+# authoritatively knows about the outcome. It is not a transfer and not a
+# provider attempt: there is no provider, recipient, bank, rail, account number
+# or webhook field here, and there will not be one in M4.
+#
+# It also introduces no new balance. Spendability is still posted minus active
+# holds; an in-flight operation is represented by a transaction row plus an
+# active reservation, never by a "pending balance".
+
+
+class FinancialTransactionQuerySet(models.QuerySet):
+    """Refuses bulk writes that would rewrite settled transaction history."""
+
+    def _resolved_rows_present(self) -> bool:
+        return self.filter(status__in=sorted(TransactionStatus.TERMINAL)).exists()
+
+    def update(self, **kwargs):
+        if self._resolved_rows_present():
+            raise TransactionIntentImmutableError(
+                'Resolved transactions cannot be updated in bulk.'
+            )
+        return super().update(**kwargs)
+
+    def delete(self):
+        raise TransactionIntentImmutableError(
+            'Financial transactions are permanent history and cannot be deleted.'
+        )
+
+
+class FinancialTransaction(models.Model):
+    """One financial operation and its authoritative lifecycle state.
+
+    The intent — wallet, direction, amount, currency, idempotency key — is fixed
+    at creation and never edited afterwards. Status moves only through
+    :mod:`moneycore.services.transactions`; the ``save()`` override below is a
+    backstop, not the supported path.
+
+    ``UNKNOWN`` is a persisted state, so an operation whose outcome is genuinely
+    unresolved survives any process or worker restart still holding its
+    reservation.
+    """
+
+    #: Fields that define what was asked for. Fixed once written.
+    INTENT_FIELDS = ('wallet_id', 'direction', 'amount_minor', 'currency',
+                     'idempotency_key')
+
+    wallet = models.ForeignKey(
+        Wallet,
+        on_delete=models.PROTECT,
+        related_name='transactions',
+    )
+    direction = models.CharField(
+        max_length=20,
+        choices=TransactionDirection.CHOICES,
+    )
+    # 64-bit signed, matching the ledger and holds. Positive magnitude only —
+    # which way the money goes is `direction`, never a sign.
+    amount_minor = models.BigIntegerField()
+    currency = models.CharField(
+        max_length=CURRENCY_CODE_LENGTH,
+        validators=[currency_code_validator],
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=TransactionStatus.CHOICES,
+        default=TransactionStatus.CREATED,
+    )
+    # The reservation backing this operation. OneToOne: a hold funds at most one
+    # transaction, so two operations can never spend the same reserved money.
+    # Null for incoming transactions, which reserve nothing.
+    hold = models.OneToOneField(
+        FundsHold,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='transaction',
+    )
+    # The posted journal that makes success true. Written only by the success
+    # path, and never rewritten afterwards.
+    journal = models.OneToOneField(
+        Journal,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='transaction',
+    )
+    # Caller-supplied, unique per wallet. Scoped to the wallet rather than
+    # globally so two customers cannot collide, and so the uniqueness constraint
+    # is the thing that actually serialises concurrent duplicate intents.
+    idempotency_key = models.CharField(max_length=128)
+    # A normalised internal code. The vocabulary is M6's to define when provider
+    # errors are first mapped; no provider text, payload, status string, stack
+    # trace or credential is ever stored here.
+    failure_code = models.CharField(max_length=64, blank=True)
+    processing_at = models.DateTimeField(null=True, blank=True)
+    unknown_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = FinancialTransactionQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'financial transaction'
+        verbose_name_plural = 'financial transactions'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(amount_minor__gt=0),
+                name='moneycore_txn_amount_positive',
+            ),
+            models.CheckConstraint(
+                check=models.Q(direction__in=sorted(TransactionDirection.ALL)),
+                name='moneycore_txn_direction_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(status__in=sorted(TransactionStatus.ALL)),
+                name='moneycore_txn_status_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(currency__regex=r'^[A-Z]{3}$'),
+                name='moneycore_txn_currency_format_valid',
+            ),
+            # One transaction per idempotency key per wallet. This is the
+            # database-level guard that makes concurrent duplicate creation safe.
+            models.UniqueConstraint(
+                fields=['wallet', 'idempotency_key'],
+                name='moneycore_txn_unique_idempotency_key_per_wallet',
+            ),
+            # Success means posted truth exists, and nothing else may carry a
+            # success journal. Enforced by the database, not only by the service.
+            models.CheckConstraint(
+                check=(
+                    models.Q(status=TransactionStatus.SUCCEEDED, journal__isnull=False)
+                    | (
+                        ~models.Q(status=TransactionStatus.SUCCEEDED)
+                        & models.Q(journal__isnull=True)
+                    )
+                ),
+                name='moneycore_txn_succeeded_requires_journal',
+            ),
+            # A resolved transaction records when; an unresolved one does not.
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        status__in=sorted(TransactionStatus.TERMINAL),
+                        resolved_at__isnull=False,
+                    )
+                    | (
+                        ~models.Q(status__in=sorted(TransactionStatus.TERMINAL))
+                        & models.Q(resolved_at__isnull=True)
+                    )
+                ),
+                name='moneycore_txn_resolved_at_matches_status',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['wallet', 'status']),
+            # Finding operations still awaiting the truth.
+            models.Index(fields=['status', 'unknown_at']),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'FinancialTransaction<{self.pk}: wallet {self.wallet_id} '
+            f'{self.direction} {self.amount_minor} {self.currency} {self.status}>'
+        )
+
+    @property
+    def amount(self) -> Money:
+        return Money(self.amount_minor, self.currency)
+
+    @property
+    def is_terminal(self) -> bool:
+        return transaction_is_terminal(self.status)
+
+    @property
+    def execution_may_have_started(self) -> bool:
+        return execution_may_have_started(self.status)
+
+    def _stored_intent(self):
+        return (
+            FinancialTransaction.objects.filter(pk=self.pk)
+            .values(*self.INTENT_FIELDS)
+            .first()
+        )
+
+    def save(self, *args, **kwargs):
+        """Refuse to rewrite settled intent.
+
+        What was asked for cannot change after the fact; only status and its
+        associated bookkeeping move, and those move through the transaction
+        services.
+        """
+        if self.pk is not None:
+            stored = self._stored_intent()
+            if stored is not None:
+                current = {field: getattr(self, field) for field in self.INTENT_FIELDS}
+                changed = [
+                    field for field in self.INTENT_FIELDS
+                    if stored[field] != current[field]
+                ]
+                if changed:
+                    raise TransactionIntentImmutableError(
+                        'A transaction\'s intent cannot be changed after creation.',
+                        details={'fields': sorted(changed)},
+                    )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TransactionIntentImmutableError(
+            'Financial transactions are permanent history and cannot be deleted.'
         )
