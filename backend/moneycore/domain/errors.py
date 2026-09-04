@@ -250,3 +250,121 @@ class WalletLedgerAccountNotFoundError(LedgerError):
     code = 'wallet_ledger_account_not_found'
     http_status = 404
     default_message = 'This wallet has no ledger account.'
+
+
+# ---------------------------------------------------------------------------
+# M3: holds and balance projection
+# ---------------------------------------------------------------------------
+# Internal domain errors. Holds have no customer-facing surface in M3, so these
+# describe reservation faults to internal callers.
+
+
+class HoldError(DomainError):
+    """Base for hold faults, so callers can catch the whole family."""
+
+    code = 'hold_error'
+    http_status = 409
+    default_message = 'The hold operation could not be completed.'
+
+
+class InvalidHoldAmountError(HoldError):
+    """The requested amount is not a usable positive integer minor-unit value."""
+
+    code = 'invalid_hold_amount'
+    http_status = 400
+    default_message = 'A hold amount must be a positive whole number of minor units.'
+
+
+class InsufficientAvailableBalanceError(HoldError):
+    """The wallet does not have enough available balance to reserve.
+
+    Available, not posted: funds already reserved by another hold are not
+    available to reserve twice.
+    """
+
+    code = 'insufficient_available_balance'
+    default_message = 'There is not enough available balance to place this hold.'
+
+
+class HoldCurrencyMismatchError(HoldError):
+    """The hold currency disagrees with its wallet's."""
+
+    code = 'hold_currency_mismatch'
+    default_message = 'A hold must use the wallet currency.'
+
+
+class WalletNotHoldableError(HoldError):
+    """The wallet or its ledger account cannot take a hold right now.
+
+    Covers a closed wallet and a closed ledger account. This is not a capability
+    policy — capability restrictions (canSend, canReceive, …) arrive with M9 and
+    are deliberately not anticipated here.
+    """
+
+    code = 'wallet_not_holdable'
+    default_message = 'This wallet cannot hold funds.'
+
+
+class InvalidHoldTransitionError(HoldError):
+    """The requested lifecycle move is not legal from the current state."""
+
+    code = 'invalid_hold_transition'
+    default_message = 'That hold status change is not allowed.'
+
+
+class HoldNotActiveError(HoldError):
+    """The operation requires an active hold, and this one is terminal."""
+
+    code = 'hold_not_active'
+    default_message = 'That hold is no longer active.'
+
+
+class HoldNotDueForExpiryError(HoldError):
+    """Expiry was requested for a hold whose time has not come.
+
+    Ending a hold early is a release, not an expiry: the two record different
+    operational facts and must not be conflated.
+    """
+
+    code = 'hold_not_due_for_expiry'
+    default_message = 'That hold is not due to expire yet.'
+
+
+class HoldImmutableError(HoldError):
+    """An attempt was made to alter or delete terminal hold history."""
+
+    code = 'hold_immutable'
+    default_message = 'A released or expired hold cannot be changed or removed.'
+
+
+class BalanceProjectionInvalidError(HoldError):
+    """The derived balance picture is not financially coherent.
+
+    Raised rather than clamped. If held funds exceed posted funds, or a wallet
+    carries a negative posted balance, something upstream is wrong — and
+    silently reporting a tidy zero would conceal it behind a plausible number.
+    """
+
+    code = 'balance_projection_invalid'
+    http_status = 500
+    default_message = 'The wallet balance is not in a coherent state.'
+
+
+class LedgerPostingConflictsWithHoldsError(LedgerError):
+    """Posting would drop a wallet's posted balance below its reserved funds.
+
+    Distinct from :class:`InsufficientAvailableBalanceError`, which is a
+    *reservation* being refused. This is a *posting* being refused: the money is
+    there, but some of it is already spoken for, and letting the journal land
+    would leave held funds exceeding posted funds — an invalid state no
+    supported operation may create.
+
+    Not resolved by clamping, by silently releasing reservations, or by
+    rewriting ledger history. The posting is simply refused.
+    """
+
+    code = 'ledger_posting_conflicts_with_holds'
+    default_message = (
+        'This posting would leave less posted balance than is currently '
+        'reserved on the wallet.'
+    )

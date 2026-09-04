@@ -386,16 +386,26 @@ class TestPostedBalance:
         assert posted_balance(wallet_account) == Money(3_000, 'NGN')
         assert posted_balance(counterpart_account) == Money(3_000, 'NGN')
 
-    def test_a_balance_may_go_negative_in_its_normal_direction(
-        self, wallet_account, counterpart_account
+    def test_an_internal_balance_may_go_negative_in_its_normal_direction(
+        self, counterpart_account, make_ledger_account
     ):
-        """The ledger records what happened; it does not enforce policy."""
+        """The ledger records what happened; it does not enforce policy.
+
+        Shown on internal accounts, which carry signed balances legitimately. A
+        wallet-backed account is different: M3's reservation guard refuses a
+        posting that would drive a customer wallet below its reserved funds, so
+        that case is covered in the holds tests rather than here.
+        """
+        other = make_ledger_account('internal:signed-probe')
+
         post_journal(
             currency='NGN',
-            entries=[debit(wallet_account, 700), credit(counterpart_account, 700)],
+            entries=[debit(counterpart_account, 700), credit(other, 700)],
         )
 
-        assert posted_balance(wallet_account) == Money(-700, 'NGN')
+        # Credit-normal would read +700; this account is debit-normal, so the
+        # credited side reads negative.
+        assert posted_balance(other) == Money(-700, 'NGN')
 
     def test_a_draft_journal_is_excluded(self, wallet_account, counterpart_account):
         """Constructed directly, bypassing the service, to prove the filter."""

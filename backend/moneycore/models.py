@@ -36,7 +36,11 @@ from moneycore.domain.currency import (
     CURRENCY_CODE_PATTERN,
     INVALID_CURRENCY_MESSAGE,
 )
-from moneycore.domain.errors import JournalImmutableError
+from django.utils import timezone
+
+from moneycore.domain.errors import HoldImmutableError, JournalImmutableError
+from moneycore.domain.holds import HoldStatus, hold_is_terminal, is_effectively_active
+from moneycore.domain.money import Money
 from moneycore.domain.ledger import (
     EntryDirection,
     JournalStatus,
@@ -495,3 +499,187 @@ class JournalEntry(models.Model):
                 'An entry of a posted journal cannot be deleted.'
             )
         return super().delete(*args, **kwargs)
+
+
+class FundsHoldQuerySet(models.QuerySet):
+    """Query helpers, plus a guard on terminal hold history.
+
+    ``update()`` and ``delete()`` bypass model ``save()``/``delete()``, so they
+    are closed here too for terminal rows. Active holds stay writable — the
+    service still has to transition them.
+    """
+
+    def effectively_active(self, at=None):
+        """Holds that actually reserve funds at ``at`` (default now).
+
+        ACTIVE and not past their expiry. Written as a query so the held total
+        is a single aggregate rather than a Python loop, and so correctness
+        never depends on a cleanup job having run.
+        """
+        moment = at if at is not None else timezone.now()
+        return self.filter(status=HoldStatus.ACTIVE).filter(
+            models.Q(expires_at__isnull=True) | models.Q(expires_at__gt=moment)
+        )
+
+    def _terminal_rows_present(self) -> bool:
+        return self.filter(status__in=sorted(HoldStatus.TERMINAL)).exists()
+
+    def update(self, **kwargs):
+        if self._terminal_rows_present():
+            raise HoldImmutableError(
+                'Released or expired holds cannot be updated in bulk.'
+            )
+        return super().update(**kwargs)
+
+    def delete(self):
+        raise HoldImmutableError(
+            'Holds are financial operational history and cannot be deleted.'
+        )
+
+
+# ===========================================================================
+# M3: holds
+# ===========================================================================
+# A hold reserves already-posted funds. It never moves money, so its whole life
+# posts nothing to the ledger — see moneycore.domain.holds for why that
+# separation matters.
+#
+# Note what is still absent, deliberately: there is no held_balance,
+# available_balance, reserved_balance or spendable_balance column anywhere in
+# this module or on Wallet, LedgerAccount or FinancialAccount. The held total is
+# aggregated from these rows and the available balance is computed, so neither
+# can drift from the reservations it describes.
+
+
+class FundsHold(models.Model):
+    """A temporary reservation against a wallet's posted funds.
+
+    Named ``FundsHold`` so the persistence name cannot be confused with the
+    ``hold`` verb used across the service layer; the domain concept is simply a
+    hold, and there is no separate "reservation" model — one concept, one name.
+
+    The amount is a positive integer number of minor units, matching the ledger
+    exactly: no float, no ``Decimal``, no negative-amount convention, and no
+    zero-value hold.
+    """
+
+    wallet = models.ForeignKey(
+        Wallet,
+        on_delete=models.PROTECT,
+        related_name='holds',
+    )
+    # Denormalised from the wallet so a hold is self-describing and the
+    # currency-consistency rule is enforceable as a database constraint. The
+    # service refuses any mismatch before a row is written.
+    currency = models.CharField(
+        max_length=CURRENCY_CODE_LENGTH,
+        validators=[currency_code_validator],
+    )
+    # 64-bit signed, matching JournalEntry.amount_minor. The bound is storage
+    # capacity, never a product limit.
+    amount_minor = models.BigIntegerField()
+    status = models.CharField(
+        max_length=20,
+        choices=HoldStatus.CHOICES,
+        default=HoldStatus.ACTIVE,
+    )
+    # Optional. Null means the hold does not expire on its own. M3 sets no
+    # default duration: how long a reservation should live depends on transfer
+    # timeout windows and provider reservation semantics that are still open.
+    expires_at = models.DateTimeField(null=True, blank=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+    expired_at = models.DateTimeField(null=True, blank=True)
+    # Free-form internal note. Deliberately not an enum: a fixed vocabulary
+    # would have to name transfers, cards or providers, and coupling a hold to
+    # transaction types M3 does not have is exactly what to avoid.
+    reason = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = FundsHoldQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'funds hold'
+        verbose_name_plural = 'funds holds'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(amount_minor__gt=0),
+                name='moneycore_hold_amount_positive',
+            ),
+            models.CheckConstraint(
+                check=models.Q(status__in=sorted(HoldStatus.ALL)),
+                name='moneycore_hold_status_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(currency__regex=r'^[A-Z]{3}$'),
+                name='moneycore_hold_currency_format_valid',
+            ),
+            # A released hold records when; a hold that is not released does not.
+            models.CheckConstraint(
+                check=(
+                    models.Q(status=HoldStatus.RELEASED, released_at__isnull=False)
+                    | (~models.Q(status=HoldStatus.RELEASED) & models.Q(released_at__isnull=True))
+                ),
+                name='moneycore_hold_released_at_matches_status',
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(status=HoldStatus.EXPIRED, expired_at__isnull=False)
+                    | (~models.Q(status=HoldStatus.EXPIRED) & models.Q(expired_at__isnull=True))
+                ),
+                name='moneycore_hold_expired_at_matches_status',
+            ),
+        ]
+        indexes = [
+            # The shape of the held-total query: active holds for one wallet,
+            # filtered by expiry.
+            models.Index(fields=['wallet', 'status', 'expires_at']),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'FundsHold<{self.pk}: wallet {self.wallet_id} '
+            f'{self.amount_minor} {self.currency} {self.status}>'
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        return hold_is_terminal(self.status)
+
+    def is_effectively_active(self, at=None) -> bool:
+        """Whether this hold actually reserves funds at ``at`` (default now)."""
+        return is_effectively_active(
+            self.status, self.expires_at, at if at is not None else timezone.now()
+        )
+
+    @property
+    def amount(self) -> Money:
+        """The reserved amount as a Money value."""
+        return Money(self.amount_minor, self.currency)
+
+    def _stored_status(self) -> str | None:
+        return (
+            FundsHold.objects.filter(pk=self.pk)
+            .values_list('status', flat=True)
+            .first()
+        )
+
+    def save(self, *args, **kwargs):
+        """Refuse to rewrite a hold that is already terminal in the database.
+
+        An active hold may still be transitioned by the service; a released or
+        expired one is operational history and stays as written.
+        """
+        if self.pk is not None:
+            stored = self._stored_status()
+            if stored is not None and hold_is_terminal(stored):
+                raise HoldImmutableError(
+                    'A released or expired hold cannot be modified.'
+                )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        """Holds are operational history and are not deleted."""
+        raise HoldImmutableError(
+            'Holds are financial operational history and cannot be deleted.'
+        )

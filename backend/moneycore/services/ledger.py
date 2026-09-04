@@ -38,6 +38,7 @@ from moneycore.domain.errors import (
     JournalNotPostedError,
     LedgerAccountClosedError,
     LedgerCurrencyMismatchError,
+    LedgerPostingConflictsWithHoldsError,
     LedgerUnbalancedError,
     WalletLedgerAccountNotFoundError,
 )
@@ -221,6 +222,87 @@ def _validate_entries(currency: str, entries: list[EntryDraft]) -> None:
         )
 
 
+def _wallet_balance_deltas(entries: list[EntryDraft]) -> dict[int, int]:
+    """The net effect this journal will have on each wallet-backed account.
+
+    Keyed by wallet id. Computed from each account's **actual** normal-balance
+    semantics, never from an assumption about how a wallet is classified — that
+    classification is still open (O-13), so a debit is not hardcoded as a spend:
+
+    * debit-normal account — a debit increases, a credit decreases
+    * credit-normal account — a credit increases, a debit decreases
+
+    Several entries touching the same account aggregate. Accounts with no wallet
+    are internal and are not represented here.
+    """
+    deltas: dict[int, int] = {}
+    for entry in entries:
+        account = entry.ledger_account
+        if account.wallet_id is None:
+            continue
+        increases = (
+            entry.direction == EntryDirection.DEBIT
+            if is_debit_normal(account.account_type)
+            else entry.direction == EntryDirection.CREDIT
+        )
+        signed = entry.amount_minor if increases else -entry.amount_minor
+        deltas[account.wallet_id] = deltas.get(account.wallet_id, 0) + signed
+    return deltas
+
+
+def _lock_wallets(wallet_ids) -> list[Wallet]:
+    """Lock the given wallet rows, always in ascending primary-key order.
+
+    A deterministic order is what stops two journals touching the same pair of
+    wallets from locking them in opposite orders and deadlocking.
+    """
+    if not wallet_ids:
+        return []
+    return list(
+        Wallet.objects.select_for_update()
+        .filter(pk__in=sorted(wallet_ids))
+        .order_by('pk')
+    )
+
+
+def _require_posting_leaves_reservations_covered(deltas: dict[int, int]) -> None:
+    """Refuse a posting that would leave a wallet's funds below its holds.
+
+    Called with the affected wallet rows already locked, so the posted balance
+    and held total read here cannot move before this journal commits.
+
+    Only wallet-backed accounts are checked: an internal ledger account carries
+    no customer reservations, so nothing constrains its balance here.
+    """
+    # Imported inside the function: holds (M3) builds on the ledger (M2), so the
+    # module-level dependency runs that way. This one reverse reference is what
+    # lets the posting service honour reservations, and a local import keeps the
+    # package-level direction intact.
+    from moneycore.services.holds import held_amount
+
+    for wallet_id, delta in deltas.items():
+        wallet = Wallet.objects.get(pk=wallet_id)
+        account = LedgerAccount.objects.get(wallet=wallet)
+
+        current = posted_balance(account).minor_units
+        resulting = current + delta
+        held = held_amount(wallet).minor_units
+
+        if resulting < held:
+            raise LedgerPostingConflictsWithHoldsError(
+                'This posting would leave less posted balance than is '
+                'currently reserved on the wallet.',
+                details={
+                    'wallet': wallet_id,
+                    'currency': wallet.currency,
+                    'posted_minor': current,
+                    'delta_minor': delta,
+                    'resulting_posted_minor': resulting,
+                    'held_minor': held,
+                },
+            )
+
+
 @transaction.atomic
 def post_journal(
     *,
@@ -238,6 +320,16 @@ def post_journal(
 
     The journal is created as a draft and posted in the same transaction, so no
     completed call leaves a draft behind.
+
+    **Wallet serialisation.** If any entry touches a wallet-backed ledger
+    account, that wallet's row is locked before anything is read or written, in
+    the same way a hold locks it. The wallet row is the single gate for every
+    operational change to spendability, so a posting and a reservation for the
+    same wallet can never evaluate against each other's stale view. Under that
+    lock the posting refuses to reduce a wallet's balance below the funds
+    already reserved against it, which is the invariant
+    ``effective_held <= posted`` — enforced whichever of the two operations
+    reaches the lock first.
     """
     if not is_valid_currency_code(currency):
         raise InvalidLedgerEntryError(
@@ -246,6 +338,12 @@ def post_journal(
         )
 
     _validate_entries(currency, entries)
+
+    # Lock every affected wallet, in a deterministic order, before reading the
+    # balances the guard below depends on.
+    deltas = _wallet_balance_deltas(entries)
+    _lock_wallets(deltas.keys())
+    _require_posting_leaves_reservations_covered(deltas)
 
     journal = Journal.objects.create(
         status=JournalStatus.DRAFT,

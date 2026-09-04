@@ -725,6 +725,46 @@ entry, and no ledger row references an `Expense`.
 
 ---
 
+## 17D. Decisions closed in M3 — holds and balance projection
+
+M3 answers a second balance question — *what is spendable?* — without disturbing
+the first. The ledger stays the only place money exists.
+
+| # | Decision | Detail |
+|---|---|---|
+| M3-1 | **A hold reserves posted funds; it never moves them** | Creating, releasing and expiring a hold each post **zero** journal entries. The ledger is untouched for a hold's entire life. Money moves only when a later domain operation explicitly posts entries, and that orchestration is M4/M5. |
+| M3-2 | **One reservation concept, named `FundsHold`** | No parallel `Reservation` model. The persistence name avoids colliding with the `hold` verb used across the service layer; the domain concept is simply a hold. |
+| M3-3 | **Lifecycle `active → released` or `active → expired`, both terminal** | Released and expired both stop reserving funds but are kept apart because *why* a reservation ended is operational history. Deliberately absent: `captured`, `settled`, `completed`, `failed`, `pending`, `processing`, `confirming` — each describes a transaction or provider outcome, and a hold knows about neither. |
+| M3-4 | **Effective expiry is a read-time predicate, not a stored flag** | A hold reserves funds when it is `active` **and** has not passed `expires_at`. An overdue hold stops reserving the moment it passes, whether or not anything has written `status=expired`. **Balance correctness therefore never depends on a cleanup job having run** — which is precisely why M3 introduces no scheduler, no Celery and no Redis. `expire_due_holds` exists as housekeeping to keep stored status honest; it changes no balance. |
+| M3-5 | **`posted` / `held` / `available`, all derived** | `posted` from the M2 ledger, `held` by integer aggregation over effectively-active holds, `available = posted − held`. **No `available_balance`, `held_balance`, `reserved_balance`, `spendable_balance` or `projected_balance` column exists** on `Wallet`, `LedgerAccount`, `FinancialAccount`, `FundsHold` or anywhere else. Nothing caches a total, so nothing can drift. |
+| M3-6 | **`BalanceProjection` is a frozen value object** | Three `Money` values, one enforced invariant (`available = posted − held`) and one enforced currency. Constructing an inconsistent or mixed-currency projection raises. |
+| M3-7 | **Amounts are positive 64-bit integer minor units** | Identical rules to the ledger: `BigIntegerField`, `amount_minor > 0` check constraint, no float, no `Decimal`, no negative-amount convention, no zero-value hold, no rounding. |
+| M3-8 | **Hold currency must equal wallet currency** | Denormalised onto the row so the rule is a database constraint, and refused by the service before a row is written. |
+| M3-9 | **The `Wallet` row is the serialisation gate for every operational change to spendability** | `create_hold`, `release_hold` and `expire_hold` take `SELECT … FOR UPDATE` on it, **and so does any ledger posting touching a wallet-backed account** (M3-10). Whoever reaches the lock first commits; the other sees the committed reality. The wallet row is a natural gate — it already exists, is exactly one per wallet, and is otherwise uncontended. **It is not a balance row, and none was invented to have something to lock** — a test asserts `Wallet`'s field set is still the six M1 columns. PostgreSQL is authoritative; SQLite's `FOR UPDATE` is a no-op and the threaded tests skip there with that stated reason. |
+| M3-10 | **Ledger posting participates in the same wallet lock, and respects reservations** | **This corrects an earlier, incorrect claim** that posting could safely skip the lock because it only ever made the posted balance larger. It does not: a journal can *decrease* a wallet-backed account's normal balance — a debit against a credit-normal wallet account does exactly that — so posting and reserving contend for the same funds. Without a shared gate, a 7 000 hold and a 7 000 debit could both commit against a 10 000 balance, leaving held above posted. `post_journal` therefore identifies every wallet-backed account in the journal, locks those `Wallet` rows **in ascending primary-key order** (deterministic, so two journals touching the same pair cannot deadlock), computes each wallet's net balance delta from the account's **actual** normal-balance semantics, and refuses the posting if any wallet's resulting balance would fall below its effectively-active held total. Internal accounts with no wallet carry no reservations and are neither locked nor checked. |
+| M3-19 | **The invariant `effective_held <= posted` holds after every supported operation** | Enforced from both sides, so the race resolves safely whichever way it lands: a hold reaching the lock first makes a conflicting debit fail with `ledger_posting_conflicts_with_holds`; a debit reaching it first makes the hold fail with `insufficient_available_balance`. Never clamped, never resolved by silently releasing a hold, never by rewriting ledger history. |
+| M3-20 | **Reversal uses the same guarded path — there is no bypass** | `reverse_journal` posts through `post_journal`, so it acquires the same locks and the same reservation guard. A reversal that would claw back funds now reserved is refused and the original is left untouched. M3 implements no finance-ops override; if one is ever needed it is a later, deliberate design. |
+| M3-21 | **Future hold consumption stays possible without changing this** | A later transaction service can, inside one outer `transaction.atomic`, acquire the wallet lock, release or consume the reservation under whatever semantics M4/M5 define, post the balanced journal, and commit atomically. M3 implements none of that — no `capture_hold`, no `CAPTURED`/`SETTLED` status — the point is only that today's boundary does not make it impossible. |
+| M3-11 | **An unmapped wallet has no projection** | Inherits the M2 rule unchanged: `wallet_balance_projection` raises `wallet_ledger_account_not_found`. It never reports 0/0/0, because "no ledger relationship" is not "zero funds". Reading a projection provisions nothing, so **O-14 stays open**. |
+| M3-12 | **Incoherent state is raised, never clamped** | Held exceeding posted, or a negative posted balance on a customer wallet, raises `balance_projection_invalid`. Reporting a tidy zero would hide the fault behind a plausible number. M3 invents no overdraft: a wallet already negative cannot take a hold. |
+| M3-13 | **Release is explicitly NOT idempotent** | A second release raises `hold_not_active` rather than quietly succeeding, so a duplicate is surfaced as the caller mistake it is. Safe-retry semantics belong to M4's idempotency keys; a private version here would pre-empt that. |
+| M3-14 | **Expiry only when actually due; ending a hold early is a release** | `expire_hold` refuses a hold that is not past `expires_at`. The two record different operational facts and are not interchangeable. |
+| M3-15 | **Terminal holds are immutable and holds are never deleted** | Model `save()` refuses to alter a released or expired row; queryset `update()` refuses when terminal rows are in scope; `delete()` is refused outright at both levels. A hold is operational history. |
+| M3-16 | **No capture, settlement or hold-to-journal conversion** | `capture_hold`, `settle_hold`, `commit_hold` and `convert_hold_to_journal` do not exist, asserted by test. Turning a reservation into accounting entries is M4/M5 orchestration. |
+| M3-17 | **Long-lived holds are supported, without transaction vocabulary** | A hold may stay `active` indefinitely, which is what will let a later milestone keep funds reserved while an outcome is UNKNOWN. Customer-facing wording such as "Being confirmed" belongs to the transaction and product layers, and no provider terminology appears on the model. |
+| M3-18 | **No customer-facing surface** | No hold or balance endpoint exists, and the M1 `GET /api/financial-account/` response is unchanged and still balance-free — verified even with funds posted and a hold active. Exposing projections to product surfaces is a later decision. |
+
+### What M3 deliberately did not build
+
+Transfers, recipients, a transaction model or state machine, transaction
+history, provider abstraction, a simulator, provider IDs, account numbers,
+webhooks, reconciliation, settlement, fees, KYC, risk, a transaction PIN,
+cooldown rules, Celery, Redis, an outbox, an idempotency-key framework,
+scheduled hold cleanup, capture or settlement orchestration, and any UI. No
+legacy `Expense` gained a hold, and no hold references one.
+
+---
+
 ## 18. Deferred and open register
 
 **DEFERRED** — awaiting investor, provider, or compliance input:
@@ -760,6 +800,11 @@ entry, and no ledger row references an `Expense`.
 | O-14 | Whether wallet ledger accounts are opened at provisioning or on first posting; M2 built the service but wires it to no trigger | §17C M2-3 |
 | O-15 | Whether ledger immutability is eventually hardened with database triggers, or continues to rest on the ORM boundary | §17C M2-13 |
 | O-16 | Whether reversal-of-reversal is ever needed; M2 refuses it | §17C M2-14 |
+| O-17 | **Default hold duration.** M3 sets none: `expires_at` is optional and has no default, because how long a reservation should live depends on transfer timeout windows and provider reservation semantics that are not decided | §17D M3-4 |
+| O-18 | Whether a wallet may ever carry a negative posted balance (overdraft). M3 invents none and rejects holds against one | §17D M3-12 |
+| O-19 | Whether and when the posted/held/available projection is exposed to product surfaces, and in what shape | §17D M3-18 |
+| O-20 | Whether hold expiry ever gains a background sweeper. M3 needs none — correctness is read-time — so this is housekeeping preference, not correctness | §17D M3-4 |
+| O-21 | Whether hold release gains idempotent retry semantics, which would arrive with M4's idempotency keys | §17D M3-13 |
 | O-2 | Rounding mode and remainder allocation for authoritative money | §7 |
 | O-3 | Reports' eventual placement | §12 |
 | O-4 | Whether NativeTabs can achieve the target glass treatment on the pinned Expo version | §13.1 |

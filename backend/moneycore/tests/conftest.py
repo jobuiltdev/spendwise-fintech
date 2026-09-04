@@ -58,3 +58,48 @@ def make_ledger_account(db):
         )
 
     return _make
+
+
+# --------------------------------------------------------------------------
+# M3: holds
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def funded_wallet(wallet, wallet_account, counterpart_account):
+    """A wallet mapped to a ledger account holding a posted balance of 10 000.
+
+    Funded through a real balanced posting, not a fabricated figure — the ledger
+    is the only way money exists.
+    """
+    from moneycore.services.ledger import credit, debit, post_journal
+
+    post_journal(
+        currency='NGN',
+        entries=[debit(counterpart_account, 10_000), credit(wallet_account, 10_000)],
+        description='Test funding',
+    )
+    return wallet
+
+
+@pytest.fixture
+def unfunded_wallet(wallet, wallet_account):
+    """Mapped to a ledger account, but nothing has ever been posted."""
+    return wallet
+
+
+@pytest.fixture
+def fund_wallet(counterpart_account):
+    """Post an arbitrary amount into a wallet's ledger account."""
+    from moneycore.services.ledger import credit, debit, post_journal
+
+    def _fund(account, amount_minor):
+        return post_journal(
+            currency=account.currency,
+            entries=[
+                debit(counterpart_account, amount_minor),
+                credit(account, amount_minor),
+            ],
+        )
+
+    return _fund

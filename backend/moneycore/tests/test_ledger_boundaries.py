@@ -24,23 +24,28 @@ def _backend_root():
     return Path(moneycore.__file__).resolve().parents[1]
 
 
-class TestNoM3OrLaterConcepts:
-    """Holds, available balance, transfers and providers are later milestones."""
+class TestNoM4OrLaterConcepts:
+    """Transfers, transactions and providers are later milestones.
 
-    def test_the_app_declares_exactly_the_m1_and_m2_models(self):
+    M2 wrote these to exclude holds as well; M3 introduced holds deliberately,
+    so the hold entity is now expected and the guard has moved forward to M4.
+    """
+
+    def test_the_app_declares_exactly_the_models_through_m3(self):
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
 
         assert declared == {
             'FinancialCustomer', 'FinancialAccount', 'Wallet',
             'LedgerAccount', 'Journal', 'JournalEntry',
+            'FundsHold',
         }
 
-    def test_no_m3_or_later_model_exists(self):
+    def test_no_m4_or_later_model_exists(self):
         declared = {
             m.__name__.lower() for m in apps.get_app_config('moneycore').get_models()
         }
         forbidden = {
-            'hold', 'reservation', 'balanceprojection', 'availablebalance',
+            'reservation', 'balanceprojection', 'availablebalance',
             'transaction', 'transfer', 'recipient', 'beneficiary', 'provider',
             'webhook', 'reconciliation', 'fee', 'settlement', 'idempotencykey',
             'outboxmessage',
@@ -49,12 +54,13 @@ class TestNoM3OrLaterConcepts:
         assert declared.isdisjoint(forbidden)
 
     @pytest.mark.parametrize('model', [LedgerAccount, Journal, JournalEntry, Wallet])
-    def test_no_hold_or_available_balance_field(self, model):
+    def test_no_stored_available_or_held_balance_field(self, model):
+        """M3 added holds as rows, never as a cached total on these models."""
         names = {f.name for f in model._meta.get_fields()}
 
         assert names.isdisjoint({
             'available_balance', 'spendable_balance', 'reserved_balance',
-            'held_balance', 'pending_debit', 'pending_credit', 'hold', 'holds',
+            'held_balance', 'pending_debit', 'pending_credit',
         })
 
     def test_the_ledger_service_exposes_no_hold_or_available_balance(self):

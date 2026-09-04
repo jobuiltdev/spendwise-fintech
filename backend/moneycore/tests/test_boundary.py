@@ -31,21 +31,22 @@ class TestSchemaMatchesTheCurrentMilestone:
 
     M1_MODELS = {'FinancialCustomer', 'FinancialAccount', 'Wallet'}
     M2_MODELS = {'LedgerAccount', 'Journal', 'JournalEntry'}
+    M3_MODELS = {'FundsHold'}
 
-    def test_the_app_declares_exactly_the_m1_and_m2_models(self):
+    def test_the_app_declares_exactly_the_models_through_m3(self):
         declared = {
             model.__name__ for model in apps.get_app_config('moneycore').get_models()
         }
 
-        assert declared == self.M1_MODELS | self.M2_MODELS
+        assert declared == self.M1_MODELS | self.M2_MODELS | self.M3_MODELS
 
-    def test_no_m3_or_later_model_has_appeared(self):
+    def test_no_m4_or_later_model_has_appeared(self):
         declared = {
             model.__name__.lower()
             for model in apps.get_app_config('moneycore').get_models()
         }
         forbidden = {
-            'hold', 'reservation', 'balance', 'balanceprojection',
+            'reservation', 'balance', 'balanceprojection',
             'availablebalance', 'transaction', 'transfer', 'recipient',
             'beneficiary', 'provider', 'webhook', 'reconciliation', 'fee',
             'settlement', 'idempotencykey', 'outboxmessage',
@@ -63,7 +64,7 @@ class TestSchemaMatchesTheCurrentMilestone:
         applied = sorted(
             path.stem for path in migrations_dir.glob('*.py') if path.stem != '__init__'
         )
-        assert len(applied) == 2
+        assert len(applied) == 3
         assert applied[0] == '0001_initial'
 
     def test_the_m1_migration_was_not_rewritten(self):
@@ -74,9 +75,21 @@ class TestSchemaMatchesTheCurrentMilestone:
         migrations_dir = Path(find_spec('moneycore.migrations').origin).parent
         initial = (migrations_dir / '0001_initial.py').read_text(encoding='utf-8')
 
-        # The ledger arrived in a later migration, never by editing this one.
+        # The ledger and holds arrived in later migrations, never by editing
+        # this one.
         assert 'LedgerAccount' not in initial
         assert 'Journal' not in initial
+        assert 'FundsHold' not in initial
+
+    def test_the_m2_migration_was_not_rewritten(self):
+        """Committed migration history stays append-only."""
+        from importlib.util import find_spec
+        from pathlib import Path
+
+        migrations_dir = Path(find_spec('moneycore.migrations').origin).parent
+        ledger = next(migrations_dir.glob('0002_*.py')).read_text(encoding='utf-8')
+
+        assert 'FundsHold' not in ledger
 
 
 class TestDomainImports:
