@@ -687,6 +687,44 @@ financial history, and no existing user was migrated.
 
 ---
 
+## 17C. Decisions closed in M2 — the double-entry ledger
+
+M2 makes posted ledger entries the single source of financial truth. It answers
+one question — *what is the posted balance?* — and deliberately not the M3
+question of what is spendable.
+
+| # | Decision | Detail |
+|---|---|---|
+| M2-1 | **Taxonomy: the five conventional account classes** | `asset`, `liability`, `equity`, `revenue`, `expense`. Product concepts (Food, Transport) are expense intelligence and never appear as ledger types. |
+| M2-2 | **`LedgerAccount` is distinct from `FinancialAccount` and `Wallet`** | `FinancialAccount` is a customer's product relationship; `Wallet` is a currency container; `LedgerAccount` is bookkeeping machinery. Three names, three jobs. |
+| M2-3 | **Wallet ↔ ledger mapping: `LedgerAccount.wallet` is a nullable `OneToOne`** | A wallet has at most one ledger account and vice versa, enforced by the database. An account with no wallet is internal. The direction was chosen so `Wallet` gains no field at all — it stays exactly as M1 left it. |
+| M2-4 | **The ledger supports the conventional taxonomy; the wallet's accounting classification is NOT decided** | `open_wallet_ledger_account` requires `account_type` as a keyword argument **with no default**, so nothing in M2 picks a class for customer funds. Whether those funds are a liability of SpendWise, an asset held on a customer's behalf, or something else follows from a custody, provider and accounting design that has not been settled — defaulting would quietly settle it. `posted_balance` reads whatever type the account actually carries, so normal-balance semantics stay correct for every class. Tests assert a wallet may map to any conventional classification and **must not** assert that a wallet account is always a liability. **OPEN — see O-13.** |
+| M2-5 | **No bank, settlement, custody or provider account is defined or seeded** | The counterpart side of a customer posting is supplied by the caller. No migration creates one, and tests build their own neutral internal counterpart. |
+| M2-6 | **Amounts are positive 64-bit integer minor units** | `BigIntegerField` with a `> 0` check constraint; direction is a separate field. A debit is never a negative credit. `MAX_AMOUNT_MINOR` is the storage bound (2⁶³−1) and **is not a product limit** — what a customer may move is a later policy decision. |
+| M2-7 | **No float or Decimal anywhere in the ledger** | Rejected at the service boundary (float, `Decimal`, `str`, `bool` and out-of-range all raise) and structurally absent from the schema. Tests assert no `FloatField`/`DecimalField` exists on any ledger model. |
+| M2-8 | **Sign convention** | `posted_balance` returns a `Money` that is positive when the account holds a balance in its **normal** direction: debit-normal (`asset`, `expense`) = debits − credits; credit-normal (`liability`, `equity`, `revenue`) = credits − debits. A wallet holding money therefore reads positive. |
+| M2-9 | **Journals are single-currency** | `Journal.currency`, `LedgerAccount.currency`, and every entry's account must match the journal. This is what makes "debits equal credits" meaningful; balancing across currencies would require an exchange rate, and there is no conversion path. FX stays **DEFERRED**. |
+| M2-10 | **Lifecycle `draft → posted`, created and posted in one transaction** | The service never leaves a draft behind. `draft` exists so "posted" is a property the balance query filters on rather than assumes, and so a half-built journal is representable and provably excluded. A check constraint ties `posted_at` to status. |
+| M2-11 | **Balancing is a service invariant, not a CHECK constraint** | A CHECK cannot express a cross-row sum. The database guards single-row facts (positive amount, valid direction); `post_journal` guards ≥2 entries and debits == credits. A test states this division explicitly. |
+| M2-12 | **All posting goes through `moneycore.services.ledger`** | No serializer, view, signal or model method creates financial truth. Posting is `@transaction.atomic`, so a rejection leaves no journal and no entries. |
+| M2-18 | **An unmapped wallet has no balance — it does not have a balance of zero** | `wallet_posted_balance` raises `wallet_ledger_account_not_found` (404) when the wallet has no ledger account. "No authoritative ledger relationship exists" and "the ledger says zero" are different facts, and returning zero for the first would state a financial fact the ledger never established — the same fabrication as a fake ₦0 on a screen. A **mapped** account with no posted entries still returns exactly `Money(0, currency)`. Reading a balance never provisions the missing account, so **O-14 stays open**. |
+| M2-13 | **Posted history is immutable** | `save()`/`delete()` on `Journal` and `JournalEntry`, plus `update()`/`delete()` on their querysets, refuse to touch posted rows. Entries are write-once even before posting. `PROTECT` stops accounts and wallets being deleted out from under history. |
+| M2-14 | **Corrections are reversals, never edits** | `reverse_journal` posts a *new* journal of exact opposites and links back via `Journal.reverses`. The original is never edited, marked or deleted — and gains no `is_reversed` flag, because the `OneToOne` on `reverses` is what limits it to one reversal, at the database level. A reversal cannot itself be reversed. |
+| M2-15 | **Concurrency: derived balances plus one deliberate lock** | Nothing caches a balance, so there is no lost update to race for. The single `select_for_update` is on the original journal during reversal, so parallel reversal attempts queue rather than both seeing "not yet reversed"; the `OneToOne` is the final guard. Verified with real threaded transactions on PostgreSQL. |
+| M2-16 | **The ledger performs no rounding** | It operates on already-resolved integer minor units. A caller that needs to split an amount that does not divide evenly owns that remainder policy. This narrows **O-5** without closing it. |
+| M2-17 | **No customer-facing ledger API** | No journal, entry, account or balance endpoint exists, and the M1 `GET /api/financial-account/` response is unchanged and still balance-free. Exposing total/available/reserved to product surfaces belongs to M3. |
+
+### What M2 deliberately did not build
+
+Holds, reservations, available/spendable/reserved/held balance, balance
+projection, transfers, recipients, a transaction engine or states, provider
+abstraction, a simulator, provider IDs, account numbers, virtual accounts,
+webhooks, reconciliation, settlement, fees, KYC, risk, Celery, Redis, an outbox,
+an idempotency-key framework, and any UI. No legacy `Expense` became a ledger
+entry, and no ledger row references an `Expense`.
+
+---
+
 ## 18. Deferred and open register
 
 **DEFERRED** — awaiting investor, provider, or compliance input:
@@ -710,7 +748,7 @@ financial history, and no existing user was migrated.
 | # | Item | Section |
 |---|---|---|
 | O-1 | Persistence representation of manual expense vs financial transaction | §6.3 |
-| O-5 | Rounding mode, allocation of remainders, and the display precision of `Money` — M0 fixed the representation only | §17A M0-5 |
+| O-5 | Rounding mode, allocation of remainders, and the display precision of `Money`. Narrowed by M2, not closed: **ledger persistence and posting operate on already-resolved integer minor units and perform no rounding**, so the policy belongs to whichever domain initiates a split | §17A M0-5, §17C M2-16 |
 | O-6 | Client-side handling of the new `{"error": {...}}` object shape, which differs from the legacy `{"error": "<string>"}` the mobile helper expects | §17A M0-6 |
 | O-7 | Whether legacy `TextField`-as-JSON columns move to `JSONField` now that PostgreSQL is available | §4.1 |
 | O-8 | What triggers provisioning in the product — M1 built the service, not the moment it is called | §17B M1-2 |
@@ -718,6 +756,10 @@ financial history, and no existing user was migrated.
 | O-10 | Whether a customer may ever hold more than one financial account or product type | §17B M1-3 |
 | O-11 | Which currencies beyond NGN are operational, and what opens a non-NGN wallet | §17B M1-6 |
 | O-12 | Whether Django admin gains read-only money-core visibility, or that waits for the M11 ops surface | §17B |
+| O-13 | **The accounting classification used for the customer-wallet representation itself**, and the counterpart taxonomy facing it — sponsor-bank cash, provider settlement, trust structure. Both follow from the custody, provider and accounting design. M2 supports the conventional taxonomy but takes no position on which class a wallet uses | §17C M2-4, M2-5 |
+| O-14 | Whether wallet ledger accounts are opened at provisioning or on first posting; M2 built the service but wires it to no trigger | §17C M2-3 |
+| O-15 | Whether ledger immutability is eventually hardened with database triggers, or continues to rest on the ORM boundary | §17C M2-13 |
+| O-16 | Whether reversal-of-reversal is ever needed; M2 refuses it | §17C M2-14 |
 | O-2 | Rounding mode and remainder allocation for authoritative money | §7 |
 | O-3 | Reports' eventual placement | §12 |
 | O-4 | Whether NativeTabs can achieve the target glass treatment on the pinned Expo version | §13.1 |

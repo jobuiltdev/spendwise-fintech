@@ -20,38 +20,40 @@ class TestAppRegistration:
         assert config.verbose_name == 'Money core'
 
 
-class TestSchemaIsExactlyM1:
-    """M0 asserted the app had no models at all. M1 deliberately supersedes that.
+class TestSchemaMatchesTheCurrentMilestone:
+    """M0 asserted no models; M1 asserted its three; M2 adds the ledger.
 
-    The assertion is now tighter rather than weaker: the app holds exactly the
-    three M1 entities and nothing else, so a ledger, journal, posting, hold,
-    transfer or transaction model appearing here fails the build.
+    Each milestone supersedes the last deliberately, and the assertion stays
+    tight rather than becoming loose: the app holds exactly the M1 and M2
+    entities, so anything from M3 onward — a hold, a transfer, a transaction —
+    fails the build the moment it appears.
     """
 
     M1_MODELS = {'FinancialCustomer', 'FinancialAccount', 'Wallet'}
+    M2_MODELS = {'LedgerAccount', 'Journal', 'JournalEntry'}
 
-    def test_the_app_declares_exactly_the_m1_models(self):
+    def test_the_app_declares_exactly_the_m1_and_m2_models(self):
         declared = {
             model.__name__ for model in apps.get_app_config('moneycore').get_models()
         }
 
-        assert declared == self.M1_MODELS
+        assert declared == self.M1_MODELS | self.M2_MODELS
 
-    def test_no_m2_or_later_model_has_appeared(self):
+    def test_no_m3_or_later_model_has_appeared(self):
         declared = {
             model.__name__.lower()
             for model in apps.get_app_config('moneycore').get_models()
         }
         forbidden = {
-            'ledger', 'ledgeraccount', 'ledgerentry', 'journal', 'journalentry',
-            'posting', 'hold', 'reservation', 'balance', 'balanceprojection',
-            'transaction', 'transfer', 'recipient', 'beneficiary', 'provider',
-            'webhook', 'reconciliation', 'fee', 'settlement',
+            'hold', 'reservation', 'balance', 'balanceprojection',
+            'availablebalance', 'transaction', 'transfer', 'recipient',
+            'beneficiary', 'provider', 'webhook', 'reconciliation', 'fee',
+            'settlement', 'idempotencykey', 'outboxmessage',
         }
 
         assert declared.isdisjoint(forbidden)
 
-    def test_the_app_has_exactly_one_migration(self):
+    def test_the_app_has_the_expected_migrations(self):
         from importlib.util import find_spec
         from pathlib import Path
 
@@ -61,7 +63,20 @@ class TestSchemaIsExactlyM1:
         applied = sorted(
             path.stem for path in migrations_dir.glob('*.py') if path.stem != '__init__'
         )
-        assert applied == ['0001_initial']
+        assert len(applied) == 2
+        assert applied[0] == '0001_initial'
+
+    def test_the_m1_migration_was_not_rewritten(self):
+        """Committed migration history is append-only."""
+        from importlib.util import find_spec
+        from pathlib import Path
+
+        migrations_dir = Path(find_spec('moneycore.migrations').origin).parent
+        initial = (migrations_dir / '0001_initial.py').read_text(encoding='utf-8')
+
+        # The ledger arrived in a later migration, never by editing this one.
+        assert 'LedgerAccount' not in initial
+        assert 'Journal' not in initial
 
 
 class TestDomainImports:

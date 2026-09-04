@@ -158,3 +158,95 @@ class WalletAlreadyExistsError(ConflictError):
 
     code = 'wallet_already_exists'
     default_message = 'A wallet already exists for this currency.'
+
+
+# ---------------------------------------------------------------------------
+# M2: double-entry ledger
+# ---------------------------------------------------------------------------
+# Internal domain errors. The ledger has no customer-facing surface, so these
+# describe bookkeeping faults to internal callers rather than to end users.
+
+
+class LedgerError(DomainError):
+    """Base for ledger faults, so callers can catch the whole family."""
+
+    code = 'ledger_error'
+    http_status = 409
+    default_message = 'The ledger operation could not be completed.'
+
+
+class LedgerUnbalancedError(LedgerError):
+    """Debits do not equal credits, so the journal cannot be posted.
+
+    Never absorbed, rounded away, or balanced with an invented suspense entry.
+    """
+
+    code = 'ledger_unbalanced'
+    default_message = 'A journal must balance: debits must equal credits.'
+
+
+class InvalidLedgerEntryError(LedgerError):
+    """An entry is structurally unusable — bad amount, direction or account."""
+
+    code = 'invalid_ledger_entry'
+    http_status = 400
+    default_message = 'The ledger entry is not valid.'
+
+
+class LedgerCurrencyMismatchError(LedgerError):
+    """An entry's account currency disagrees with the journal's currency.
+
+    M2 journals are single-currency. There is no conversion here: FX is not
+    implemented, and balancing across currencies would silently invent a rate.
+    """
+
+    code = 'ledger_currency_mismatch'
+    default_message = 'Every entry must use the journal currency.'
+
+
+class LedgerAccountClosedError(LedgerError):
+    """The ledger account is closed and cannot take new postings."""
+
+    code = 'ledger_account_closed'
+    default_message = 'That ledger account is closed.'
+
+
+class JournalAlreadyPostedError(LedgerError):
+    """The journal is already posted; posted history is immutable."""
+
+    code = 'journal_already_posted'
+    default_message = 'That journal has already been posted.'
+
+
+class JournalImmutableError(LedgerError):
+    """An attempt was made to alter or delete posted financial history."""
+
+    code = 'journal_immutable'
+    default_message = 'Posted ledger history cannot be changed or removed.'
+
+
+class JournalNotPostedError(LedgerError):
+    """The operation requires a posted journal."""
+
+    code = 'journal_not_posted'
+    default_message = 'That journal has not been posted.'
+
+
+class JournalAlreadyReversedError(LedgerError):
+    """The journal already has a reversal; a second one would double-count."""
+
+    code = 'journal_already_reversed'
+    default_message = 'That journal has already been reversed.'
+
+
+class WalletLedgerAccountNotFoundError(LedgerError):
+    """The wallet has no ledger account, so it has no authoritative balance.
+
+    Distinct from a balance of zero. "No ledger relationship exists yet" and
+    "the ledger says zero" are different facts, and collapsing them would report
+    a fabricated figure for a wallet that has never been mapped.
+    """
+
+    code = 'wallet_ledger_account_not_found'
+    http_status = 404
+    default_message = 'This wallet has no ledger account.'

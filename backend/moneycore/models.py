@@ -36,6 +36,14 @@ from moneycore.domain.currency import (
     CURRENCY_CODE_PATTERN,
     INVALID_CURRENCY_MESSAGE,
 )
+from moneycore.domain.errors import JournalImmutableError
+from moneycore.domain.ledger import (
+    EntryDirection,
+    JournalStatus,
+    LedgerAccountStatus,
+    LedgerAccountType,
+    is_debit_normal,
+)
 from moneycore.domain.lifecycle import AccountStatus, CustomerStatus, WalletStatus
 
 # Same rule the Money value type applies, so a currency code means the same
@@ -170,3 +178,320 @@ class Wallet(models.Model):
 
     def __str__(self) -> str:
         return f'Wallet<{self.financial_account_id}: {self.currency} {self.status}>'
+
+
+# ===========================================================================
+# M2: the double-entry ledger
+# ===========================================================================
+# Posted ledger entries are the single source of financial truth. No balance is
+# stored anywhere — not on Wallet (M1), not on LedgerAccount — because a second
+# copy of a balance is a second thing that can be wrong. Balances are derived by
+# moneycore.services.ledger.posted_balance from posted entries only.
+#
+# Everything below is written through moneycore.services.ledger. The save and
+# delete overrides here are a backstop that makes posted history refuse to
+# change through ordinary ORM paths; they are not a substitute for the service.
+
+
+class LedgerAccount(models.Model):
+    """An accounting bucket in double-entry bookkeeping.
+
+    Distinct from :class:`FinancialAccount`, which is a customer's product
+    relationship, and from :class:`Wallet`, which is a currency container. A
+    LedgerAccount is bookkeeping machinery: the thing entries are posted against.
+
+    An account with a ``wallet`` is that wallet's customer account. An account
+    without one is internal — a counterpart that some internal process owns. No
+    provider, bank, custody or settlement account is defined here: that taxonomy
+    depends on a banking partner that has not been chosen.
+    """
+
+    code = models.CharField(
+        max_length=64,
+        unique=True,
+        help_text='Stable internal identifier. Not customer-facing.',
+    )
+    name = models.CharField(max_length=128, help_text='Internal label.')
+    account_type = models.CharField(
+        max_length=20,
+        choices=LedgerAccountType.CHOICES,
+    )
+    currency = models.CharField(
+        max_length=CURRENCY_CODE_LENGTH,
+        validators=[currency_code_validator],
+    )
+    # A wallet has at most one ledger account, and an account belongs to at most
+    # one wallet. Null means an internal account with no customer owner.
+    wallet = models.OneToOneField(
+        Wallet,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='ledger_account',
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=LedgerAccountStatus.CHOICES,
+        default=LedgerAccountStatus.ACTIVE,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'ledger account'
+        verbose_name_plural = 'ledger accounts'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(account_type__in=sorted(LedgerAccountType.ALL)),
+                name='moneycore_ledger_account_type_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(status__in=sorted(LedgerAccountStatus.ALL)),
+                name='moneycore_ledger_account_status_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(currency__regex=r'^[A-Z]{3}$'),
+                name='moneycore_ledger_account_currency_format_valid',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['currency', 'account_type']),
+        ]
+
+    def __str__(self) -> str:
+        return f'LedgerAccount<{self.code}: {self.account_type} {self.currency}>'
+
+    @property
+    def is_debit_normal(self) -> bool:
+        return is_debit_normal(self.account_type)
+
+
+class PostedHistoryQuerySet(models.QuerySet):
+    """Refuses bulk writes that would rewrite posted financial history.
+
+    ``update()`` and ``delete()`` bypass model ``save()``/``delete()``, so they
+    are closed here too. Unposted rows stay freely writable — only posted truth
+    is protected.
+    """
+
+    def _posted_rows_present(self) -> bool:
+        raise NotImplementedError
+
+    def update(self, **kwargs):
+        if self._posted_rows_present():
+            raise JournalImmutableError(
+                'Posted ledger history cannot be updated in bulk.'
+            )
+        return super().update(**kwargs)
+
+    def delete(self):
+        if self._posted_rows_present():
+            raise JournalImmutableError(
+                'Posted ledger history cannot be deleted in bulk.'
+            )
+        return super().delete()
+
+
+class JournalQuerySet(PostedHistoryQuerySet):
+    def _posted_rows_present(self) -> bool:
+        return self.filter(status=JournalStatus.POSTED).exists()
+
+    def posted(self):
+        return self.filter(status=JournalStatus.POSTED)
+
+
+class JournalEntryQuerySet(PostedHistoryQuerySet):
+    def _posted_rows_present(self) -> bool:
+        return self.filter(journal__status=JournalStatus.POSTED).exists()
+
+    def posted(self):
+        return self.filter(journal__status=JournalStatus.POSTED)
+
+
+class Journal(models.Model):
+    """One accounting event, and the unit of the balancing invariant.
+
+    Created and posted inside a single transaction by
+    :func:`moneycore.services.ledger.post_journal`, so a draft never survives a
+    completed posting call. Once posted it is immutable: corrections are made by
+    posting a *new* reversing journal, never by editing this one.
+
+    Single-currency by construction. Every entry's account must use
+    ``currency``, which is what makes "debits equal credits" a meaningful
+    statement — balancing across currencies would require an exchange rate, and
+    FX is not implemented.
+    """
+
+    status = models.CharField(
+        max_length=20,
+        choices=JournalStatus.CHOICES,
+        default=JournalStatus.DRAFT,
+    )
+    currency = models.CharField(
+        max_length=CURRENCY_CODE_LENGTH,
+        validators=[currency_code_validator],
+    )
+    description = models.CharField(max_length=255, blank=True)
+    # Provider-neutral internal reference. Deliberately not unique: it carries
+    # no defined semantics yet, and idempotency keys are M4.
+    reference = models.CharField(max_length=128, blank=True)
+    posted_at = models.DateTimeField(null=True, blank=True)
+    # The journal this one reverses. OneToOne, so the database allows at most
+    # one reversal per original — enforced without touching the original row.
+    reverses = models.OneToOneField(
+        'self',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='reversed_by',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = JournalQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'journal'
+        verbose_name_plural = 'journals'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(status__in=sorted(JournalStatus.ALL)),
+                name='moneycore_journal_status_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(currency__regex=r'^[A-Z]{3}$'),
+                name='moneycore_journal_currency_format_valid',
+            ),
+            # A posted journal has a posting time; a draft has none.
+            models.CheckConstraint(
+                check=(
+                    models.Q(status=JournalStatus.POSTED, posted_at__isnull=False)
+                    | models.Q(status=JournalStatus.DRAFT, posted_at__isnull=True)
+                ),
+                name='moneycore_journal_posted_at_matches_status',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['status', 'posted_at']),
+        ]
+
+    def __str__(self) -> str:
+        return f'Journal<{self.pk}: {self.status} {self.currency}>'
+
+    @property
+    def is_posted(self) -> bool:
+        return self.status == JournalStatus.POSTED
+
+    def save(self, *args, **kwargs):
+        """Refuse to rewrite a journal already posted in the database.
+
+        The one permitted change to such a row is the draft to posted
+        transition itself, which the posting service performs before the row is
+        posted in the database.
+        """
+        if self.pk is not None:
+            already_posted = Journal.objects.filter(
+                pk=self.pk, status=JournalStatus.POSTED
+            ).exists()
+            if already_posted:
+                raise JournalImmutableError(
+                    'A posted journal cannot be modified. Post a reversing '
+                    'journal instead.'
+                )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self.is_posted:
+            raise JournalImmutableError('A posted journal cannot be deleted.')
+        return super().delete(*args, **kwargs)
+
+
+class JournalEntry(models.Model):
+    """A single debit or credit against one ledger account.
+
+    Magnitude and direction are separate: ``amount_minor`` is always a positive
+    integer number of the currency's smallest unit, and ``direction`` says which
+    side it lands on. A debit is never stored as a negative credit, and no
+    decimal or floating-point amount exists anywhere in the ledger.
+
+    The entry has no currency of its own — it uses its account's, and the
+    posting service requires that to equal the journal's.
+    """
+
+    journal = models.ForeignKey(
+        Journal,
+        on_delete=models.PROTECT,
+        related_name='entries',
+    )
+    ledger_account = models.ForeignKey(
+        LedgerAccount,
+        on_delete=models.PROTECT,
+        related_name='entries',
+    )
+    direction = models.CharField(max_length=10, choices=EntryDirection.CHOICES)
+    # 64-bit signed integer. The database bound is storage capacity, not a
+    # product limit — what a customer may move is a later policy decision.
+    amount_minor = models.BigIntegerField()
+    sequence = models.PositiveSmallIntegerField(
+        help_text='Position within the journal, for stable ordering.'
+    )
+    memo = models.CharField(max_length=255, blank=True)
+
+    objects = JournalEntryQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'journal entry'
+        verbose_name_plural = 'journal entries'
+        ordering = ['journal_id', 'sequence']
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(amount_minor__gt=0),
+                name='moneycore_entry_amount_positive',
+            ),
+            models.CheckConstraint(
+                check=models.Q(direction__in=sorted(EntryDirection.ALL)),
+                name='moneycore_entry_direction_valid',
+            ),
+            models.UniqueConstraint(
+                fields=['journal', 'sequence'],
+                name='moneycore_entry_unique_sequence_per_journal',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['ledger_account', 'direction']),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'JournalEntry<{self.journal_id}#{self.sequence}: '
+            f'{self.direction} {self.amount_minor}>'
+        )
+
+    @property
+    def currency(self) -> str:
+        """Inherited from the account. Entries never carry their own."""
+        return self.ledger_account.currency
+
+    def _journal_is_posted(self) -> bool:
+        return Journal.objects.filter(
+            pk=self.journal_id, status=JournalStatus.POSTED
+        ).exists()
+
+    def save(self, *args, **kwargs):
+        """Entries are write-once, and none may join a posted journal."""
+        if self.pk is not None:
+            raise JournalImmutableError(
+                'A ledger entry cannot be modified once written. Post a '
+                'reversing journal instead.'
+            )
+        if self._journal_is_posted():
+            raise JournalImmutableError(
+                'An entry cannot be added to a posted journal.'
+            )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self._journal_is_posted():
+            raise JournalImmutableError(
+                'An entry of a posted journal cannot be deleted.'
+            )
+        return super().delete(*args, **kwargs)
