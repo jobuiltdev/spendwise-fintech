@@ -651,6 +651,42 @@ building any of them against imagined requirements would guarantee rework.
 
 ---
 
+## 17B. Decisions closed in M1 — customer / financial account / wallet
+
+M1 introduced the first persistent financial schema. It establishes *identity and
+lifecycle only*. **It establishes no balance**: the ledger (M2) becomes the
+authoritative source for what money exists, and balance projection (M3) for what
+is spendable.
+
+| # | Decision | Detail |
+|---|---|---|
+| M1-1 | **`FinancialCustomer` is separate from `User` and `Profile`** | `User 1 — 0..1 FinancialCustomer`, enforced by a `OneToOneField`. A user can use every legacy SpendWise feature without one; that is Tier 0. It duplicates **no** identity data (no email, phone or names) — those stay owned by the accounts/profile domain. Statuses: `active`, `closed`. |
+| M1-2 | **Provisioning is explicit — never a signal** | No receiver watches `User`, and `MoneyCoreConfig` has no `ready()` hook, so existing SpendWise users do not silently acquire a financial relationship. Tests assert both, and that registering through the API creates no financial rows. |
+| M1-3 | **`FinancialAccount` — one per customer** | `FinancialCustomer 1 — 0..1 FinancialAccount`, `OneToOneField`. Multiple accounts or product types are not modelled; nothing in the architecture needs them yet. |
+| M1-4 | **Account lifecycle: `pending_activation → active ⇄ suspended → closed`** | `pending_activation` (provisioned, not usable — the activation-path state), `active`, `suspended` (reversible), `closed` (terminal). The initial state is named explicitly rather than a bare `pending`, because SpendWise will later carry pending KYC, provider, compliance and transaction states, and an unqualified `pending` would not say which of them it meant. **`restricted` is deliberately absent**: the architecture requires restrictions to be capability-driven (`canSend`, `canReceive`, …) rather than a generic "account restricted", and those capabilities arrive at M9. At M1 there are no operations to restrict, so a `restricted` state would carry no behavioural distinction from `suspended`. |
+| M1-5 | **Transitions go through a service, and self-transitions are refused** | `moneycore.services.lifecycle.transition_account` is the only supported way to move an account. Unknown targets, illegal moves and no-op self-transitions all raise. `activated_at` is stamped on **first** activation only; `closed_at` on closure. |
+| M1-6 | **`Wallet` is a currency container with `1..N` per account** | `UniqueConstraint(financial_account, currency)`. Currency uses the **same** ISO-4217 alpha-3 rule as the `Money` value type, shared through `moneycore.domain.currency` and enforced by a field validator *and* a database check constraint. Statuses: `active`, `closed` — a wallet is not independently suspendable in the current architecture, so it has no `suspended`. |
+| M1-7 | **A wallet holds no balance — non-negotiable** | No `balance`, `available_balance`, `ledger_balance`, `spendable_balance`, `pending_balance`, `reserved_balance`, `held_balance` or `total_balance`; no numeric money column of any name; no `credit()`/`debit()` helper; no signal maintaining any such column. A test asserts the concrete field set is exactly `{id, financial_account, currency, status, created_at, updated_at}`. |
+| M1-8 | **Provisioning is result-idempotent** | `provision_financial_account(user)` converges on exactly one customer, account and wallet per currency. It is ordinary domain idempotence — `get_or_create` inside one `transaction.atomic`, with the unique constraints as the final guard against concurrent duplicates. It is **not** the M4 idempotency-key framework. |
+| M1-9 | **Provisioning ≠ activation** | Provisioning leaves the account `pending_activation`. Activation is a separate lifecycle transition that asserts nothing about verification; KYC is M10, and no customer-facing activation flow exists. |
+| M1-10 | **One authenticated read endpoint, no write surface** | `GET /api/financial-account/` returns the caller's own relationship. There is no router CRUD for `FinancialCustomer`, `FinancialAccount` or `Wallet` — a client cannot POST `status=active` or create wallets. Write methods return 405. |
+| M1-11 | **Absence is a 200, not a 404** | An unprovisioned user gets `{"customer": null, "account": null, "wallets": []}`. Being Tier 0 is an expected state the Home experience renders an activation path for — a 404 would make a normal state look like a failure, and a zero balance would be a fabricated financial figure (`UX_RULES` R1.5, R1.8). |
+| M1-12 | **Ownership is structural, not checked** | The view resolves the relationship from `request.user` and accepts no identifier, so there is no id to tamper with and no lookup that could reach another user's data. The serialised response exposes no primary keys at all. |
+| M1-13 | **No provider references, no account numbers** | No `provider_*`, `bank_account_number`, `bank_code`, `virtual_account_number`, `iban` or `external_id` on any model or in any response. Provider integration is M6; fabricating an account number before receive-money infrastructure exists would put a fake bank account in front of a customer. |
+| M1-14 | **Error codes added** | `financial_account_not_found` (404), `invalid_account_transition` (409), `invalid_wallet_transition` (409), `wallet_already_exists` (409) — all using the M0 `DomainError` shape and correlation-id integration. No second error format. |
+
+### What M1 deliberately did not build
+
+Ledger accounts, journals, entries, a posting service, debit/credit accounting,
+authoritative or available balance, holds, reservations, balance projection,
+transfers, recipients, a transaction engine or history, provider abstraction, a
+simulator, webhooks, reconciliation, fees, settlement, KYC, risk rules, limits, a
+transaction PIN, capability restrictions, ops tooling, Celery, Redis, an outbox,
+an idempotency-key framework, and any mobile UI. No legacy expense became
+financial history, and no existing user was migrated.
+
+---
+
 ## 18. Deferred and open register
 
 **DEFERRED** — awaiting investor, provider, or compliance input:
@@ -677,6 +713,11 @@ building any of them against imagined requirements would guarantee rework.
 | O-5 | Rounding mode, allocation of remainders, and the display precision of `Money` — M0 fixed the representation only | §17A M0-5 |
 | O-6 | Client-side handling of the new `{"error": {...}}` object shape, which differs from the legacy `{"error": "<string>"}` the mobile helper expects | §17A M0-6 |
 | O-7 | Whether legacy `TextField`-as-JSON columns move to `JSONField` now that PostgreSQL is available | §4.1 |
+| O-8 | What triggers provisioning in the product — M1 built the service, not the moment it is called | §17B M1-2 |
+| O-9 | Whether `restricted` becomes an account state, or restriction stays purely capability-driven at M9 | §17B M1-4 |
+| O-10 | Whether a customer may ever hold more than one financial account or product type | §17B M1-3 |
+| O-11 | Which currencies beyond NGN are operational, and what opens a non-NGN wallet | §17B M1-6 |
+| O-12 | Whether Django admin gains read-only money-core visibility, or that waits for the M11 ops surface | §17B |
 | O-2 | Rounding mode and remainder allocation for authoritative money | §7 |
 | O-3 | Reports' eventual placement | §12 |
 | O-4 | Whether NativeTabs can achieve the target glass treatment on the pinned Expo version | §13.1 |

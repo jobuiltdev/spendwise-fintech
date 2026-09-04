@@ -33,6 +33,11 @@ from analytics.views import (
 #  Reports
 from reports.views import ReportViewSet, ScheduledReportViewSet
 
+# Money core (M1): the authenticated read view for the caller's own financial
+# relationship. Deliberately not a router registration — these are system-owned
+# resources with no client-writable CRUD surface.
+from moneycore.api.views import FinancialAccountView
+
 
 router = DefaultRouter()
 
@@ -82,6 +87,7 @@ urlpatterns = [
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('api/token/logout/', LogoutView.as_view(), name='token_logout'),
     path('api/token/logout-all/', LogoutAllView.as_view(), name='token_logout_all'),
+    path('api/financial-account/', FinancialAccountView.as_view(), name='financial-account'),
 ]
 
 if settings.DEBUG:

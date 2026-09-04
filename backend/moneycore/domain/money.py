@@ -17,13 +17,9 @@ belong to later milestones.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from typing import Final
 
-# ISO 4217 alpha-3: exactly three uppercase letters. Codes are not normalised —
-# a lowercase code is a caller bug, and quietly upper-casing it would hide that.
-_CURRENCY_PATTERN: Final = re.compile(r'^[A-Z]{3}$')
+from moneycore.domain.currency import is_valid_currency_code
 
 
 class CurrencyMismatchError(ValueError):
@@ -59,7 +55,7 @@ class Money:
                 f'smallest unit), got {type(self.minor_units).__name__}. '
                 'Money never accepts float or Decimal input.'
             )
-        if not isinstance(self.currency, str) or not _CURRENCY_PATTERN.match(self.currency):
+        if not is_valid_currency_code(self.currency):
             raise ValueError(
                 'currency must be an ISO-4217 alpha-3 code in uppercase, '
                 f'got {self.currency!r}.'

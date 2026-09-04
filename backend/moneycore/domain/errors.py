@@ -119,3 +119,42 @@ class ProviderUnavailableError(DomainError):
     def provider_detail(self) -> str | None:
         """The raw upstream detail, for logging only."""
         return self._provider_detail
+
+
+# ---------------------------------------------------------------------------
+# M1: customer / financial account / wallet
+# ---------------------------------------------------------------------------
+
+
+class FinancialAccountNotFoundError(NotFoundError):
+    """The user has no financial account.
+
+    Raised by services that need one. The read API does **not** use this: a user
+    without a financial relationship is a normal, expected state (Tier 0), not
+    an error, and treating it as one would make the activation path look like a
+    failure.
+    """
+
+    code = 'financial_account_not_found'
+    default_message = 'No financial account exists for this user.'
+
+
+class InvalidAccountTransitionError(ConflictError):
+    """The requested lifecycle move is not legal from the current state."""
+
+    code = 'invalid_account_transition'
+    default_message = 'That account status change is not allowed.'
+
+
+class InvalidWalletTransitionError(ConflictError):
+    """The requested wallet lifecycle move is not legal from the current state."""
+
+    code = 'invalid_wallet_transition'
+    default_message = 'That wallet status change is not allowed.'
+
+
+class WalletAlreadyExistsError(ConflictError):
+    """The account already holds a wallet in this currency."""
+
+    code = 'wallet_already_exists'
+    default_message = 'A wallet already exists for this currency.'
