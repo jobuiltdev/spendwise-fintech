@@ -257,3 +257,5 @@ class TestNoReservationDuplicateConcept:
 
         assert related == {'Wallet', 'FinancialTransaction'}
         assert 'Expense' not in related
+        # M5 links a Transfer to the transaction, never to the hold.
+        assert 'Transfer' not in related

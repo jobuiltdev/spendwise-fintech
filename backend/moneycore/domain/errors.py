@@ -493,3 +493,113 @@ class TransactionIntentImmutableError(TransactionError):
         'A transaction\'s wallet, direction, amount, currency and idempotency '
         'key cannot be changed after creation.'
     )
+
+
+# ===========================================================================
+# M5: transfers
+# ===========================================================================
+# The transfer domain owns business intent — who the money is going to — and
+# nothing about how it is executed. No error here names a provider, carries a
+# provider payload, or describes a bank-network outcome; those belong to M6.
+
+
+class TransferError(DomainError):
+    """Base class for every transfer-domain failure."""
+
+    code = 'transfer_error'
+    default_message = 'The transfer could not be completed.'
+
+
+class TransferNotFoundError(TransferError, NotFoundError):
+    """No transfer exists for the given reference."""
+
+    code = 'transfer_not_found'
+    default_message = 'That transfer does not exist.'
+
+
+class InvalidTransferAmountError(TransferError, ValidationError):
+    """The principal is not a usable amount.
+
+    Covers zero, negatives, floats, `Decimal`, `bool` and out-of-range values.
+    A transfer principal is a positive whole number of minor units.
+    """
+
+    code = 'invalid_transfer_amount'
+    default_message = (
+        'A transfer amount must be a positive whole number of minor units.'
+    )
+
+
+class TransferCurrencyMismatchError(TransferError, ValidationError):
+    """The transfer, its wallet and its transaction must share one currency.
+
+    M5 performs no currency conversion: a transfer that changed currency would
+    need an exchange rate this milestone has no business inventing.
+    """
+
+    code = 'transfer_currency_mismatch'
+    default_message = 'A transfer must use the wallet currency.'
+
+
+class InvalidTransferDestinationError(TransferError, ValidationError):
+    """The destination is not a usable bank account.
+
+    Raised for a malformed account number, an unusable bank code, or a missing
+    bank or recipient name. It never means "this account does not exist" — M5
+    performs no verification and makes no such claim.
+    """
+
+    code = 'invalid_transfer_destination'
+    default_message = 'That transfer destination is not valid.'
+
+
+class TransferIdempotencyConflictError(TransferError, ConflictError):
+    """The idempotency key was already used for a different transfer.
+
+    Critically, this includes a *different destination*: the same key, wallet,
+    amount and currency with a different recipient is a different transfer, and
+    quietly returning the earlier one would send money to the wrong person.
+    """
+
+    code = 'transfer_idempotency_conflict'
+    default_message = (
+        'That idempotency key was already used for a different transfer.'
+    )
+
+
+class TransferTransactionMismatchError(TransferError, ConflictError):
+    """The transfer and financial transaction do not belong together.
+
+    Also raised when an idempotency key already names a financial transaction
+    that is not a transfer's, or is no longer an untouched intent that a
+    transfer can back.
+    """
+
+    code = 'transfer_transaction_mismatch'
+    default_message = (
+        'That financial transaction does not belong to this transfer.'
+    )
+
+
+class TransferAccountingInvalidError(TransferError, ValidationError):
+    """The proposed entries do not represent this transfer's principal.
+
+    The wallet's posted normal balance must fall by exactly the transfer
+    principal — no more, no less — whichever way the wallet's ledger account is
+    classified.
+    """
+
+    code = 'transfer_accounting_invalid'
+    default_message = (
+        'The transfer accounting does not match the transfer principal.'
+    )
+
+
+class TransferImmutableError(TransferError, ConflictError):
+    """An attempt was made to rewrite or delete settled transfer intent."""
+
+    code = 'transfer_immutable'
+    default_message = (
+        'A transfer\'s destination, narration and transaction cannot be '
+        'changed after preparation.'
+    )

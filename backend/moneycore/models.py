@@ -42,6 +42,7 @@ from moneycore.domain.errors import (
     HoldImmutableError,
     JournalImmutableError,
     TransactionIntentImmutableError,
+    TransferImmutableError,
 )
 from moneycore.domain.holds import HoldStatus, hold_is_terminal, is_effectively_active
 from moneycore.domain.transactions import (
@@ -51,6 +52,13 @@ from moneycore.domain.transactions import (
 )
 from moneycore.domain.transactions import is_terminal as transaction_is_terminal
 from moneycore.domain.money import Money
+from moneycore.domain.transfers import (
+    ACCOUNT_NAME_MAX_LENGTH,
+    BANK_CODE_MAX_LENGTH,
+    BANK_NAME_MAX_LENGTH,
+    NARRATION_MAX_LENGTH,
+    NGN_BANK_ACCOUNT_NUMBER_LENGTH,
+)
 from moneycore.domain.ledger import (
     EntryDirection,
     JournalStatus,
@@ -909,4 +917,198 @@ class FinancialTransaction(models.Model):
     def delete(self, *args, **kwargs):
         raise TransactionIntentImmutableError(
             'Financial transactions are permanent history and cannot be deleted.'
+        )
+
+
+# ===========================================================================
+# M5: transfers
+# ===========================================================================
+# A Transfer is business intent: which bank transfer the customer is making.
+# It is deliberately NOT the lifecycle. The linked FinancialTransaction stays
+# the authoritative source of status, reservation, success journal, idempotency
+# and failure outcome, so nothing here duplicates any of that.
+#
+# Nothing here is a provider concept either. There is no provider, provider
+# reference, provider status, webhook id, settlement reference, reconciliation
+# state or external transaction id — those arrive with M6 and later.
+#
+# Wallet, amount and currency are deliberately NOT stored. They already exist
+# on the financial transaction as immutable intent, and a second copy is a
+# second thing that can disagree. They are exposed as read-through properties
+# instead.
+
+
+class TransferQuerySet(models.QuerySet):
+    """Refuses the bulk paths that would rewrite settled transfer intent."""
+
+    def update(self, **kwargs):
+        raise TransferImmutableError(
+            'Transfers record historical intent and cannot be updated in bulk.'
+        )
+
+    def delete(self):
+        raise TransferImmutableError(
+            'Transfers are permanent history and cannot be deleted.'
+        )
+
+
+class Transfer(models.Model):
+    """One customer-originated outgoing bank transfer.
+
+    **Outgoing only.** Receiving money needs provider and webhook knowledge
+    that does not exist yet, so M5 models no incoming transfer.
+
+    The destination is a **snapshot**, not a reference. A saved recipient could
+    later be edited and a bank's display name could change; a transfer that
+    read through to a mutable record would then start describing an attempt
+    that never happened. What is stored here is what was actually sent to.
+
+    There is no status field. ``status`` reads through to the financial
+    transaction, so there is exactly one lifecycle and it lives in M4.
+    """
+
+    #: Fields fixed at preparation. A transfer to different details, or with a
+    #: different note, is a different transfer.
+    INTENT_FIELDS = (
+        'financial_transaction_id',
+        'recipient_name',
+        'destination_account_number',
+        'destination_bank_code',
+        'destination_bank_name',
+        'narration',
+    )
+
+    # OneToOne: exactly one transfer per financial transaction, and exactly one
+    # financial transaction per transfer. The relationship is owned here so
+    # FinancialTransaction stays usable for future non-transfer operations and
+    # gains no transfer-specific column.
+    financial_transaction = models.OneToOneField(
+        FinancialTransaction,
+        on_delete=models.PROTECT,
+        related_name='transfer',
+    )
+
+    # --- destination snapshot -------------------------------------------
+    #: The verified account name as resolved at preparation time.
+    recipient_name = models.CharField(max_length=ACCOUNT_NAME_MAX_LENGTH)
+    # Ten digits per the CURRENT NGN bank transfer product rule (see
+    # moneycore.domain.transfers). This is not a universal moneycore invariant:
+    # a future rail with a different account format needs its own destination
+    # type rather than a looser column here.
+    destination_account_number = models.CharField(
+        max_length=NGN_BANK_ACCOUNT_NUMBER_LENGTH
+    )
+    # An opaque validated code. M5 knows no provider bank-code vocabulary and
+    # bundles no bank directory; mapping ours to a provider's is M6's job.
+    destination_bank_code = models.CharField(max_length=BANK_CODE_MAX_LENGTH)
+    destination_bank_name = models.CharField(max_length=BANK_NAME_MAX_LENGTH)
+
+    #: A short customer note. Bounded so it cannot become somewhere to stash a
+    #: payload, and never a place for provider data.
+    narration = models.CharField(max_length=NARRATION_MAX_LENGTH, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = TransferQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'transfer'
+        verbose_name_plural = 'transfers'
+        constraints = [
+            # The current NGN bank transfer rule, enforced by the database as
+            # well as by the domain value object.
+            models.CheckConstraint(
+                check=models.Q(destination_account_number__regex=r'^[0-9]{10}$'),
+                name='moneycore_transfer_account_number_ngn_format',
+            ),
+            models.CheckConstraint(
+                check=~models.Q(destination_bank_code=''),
+                name='moneycore_transfer_bank_code_present',
+            ),
+            models.CheckConstraint(
+                check=~models.Q(destination_bank_name=''),
+                name='moneycore_transfer_bank_name_present',
+            ),
+            models.CheckConstraint(
+                check=~models.Q(recipient_name=''),
+                name='moneycore_transfer_recipient_name_present',
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'Transfer<{self.pk}: {self.destination_bank_code} '
+            f'{self.destination_account_number} {self.status}>'
+        )
+
+    # --- read-through, never stored -------------------------------------
+
+    @property
+    def wallet(self) -> Wallet:
+        """The originating wallet. Read from the transaction, never copied."""
+        return self.financial_transaction.wallet
+
+    @property
+    def amount_minor(self) -> int:
+        """The transfer principal, in minor units."""
+        return self.financial_transaction.amount_minor
+
+    @property
+    def currency(self) -> str:
+        return self.financial_transaction.currency
+
+    @property
+    def amount(self) -> Money:
+        return self.financial_transaction.amount
+
+    @property
+    def status(self) -> str:
+        """Convenience only. The transaction is the single source of truth.
+
+        Nothing writes this, and no ``transfer_status``, ``bank_status`` or
+        ``payment_status`` column exists — a second lifecycle is a second thing
+        that can disagree with the first.
+        """
+        return self.financial_transaction.status
+
+    @property
+    def hold(self):
+        return self.financial_transaction.hold
+
+    @property
+    def journal(self):
+        return self.financial_transaction.journal
+
+    def _stored_intent(self):
+        return (
+            Transfer.objects.filter(pk=self.pk).values(*self.INTENT_FIELDS).first()
+        )
+
+    def save(self, *args, **kwargs):
+        """Refuse to rewrite settled intent.
+
+        Destination, narration and the transaction link are historical facts
+        about an attempt that was made. A transfer to a different recipient is
+        a new transfer, not an edit of this one.
+        """
+        if self.pk is not None:
+            stored = self._stored_intent()
+            if stored is not None:
+                current = {field: getattr(self, field) for field in self.INTENT_FIELDS}
+                changed = [
+                    field for field in self.INTENT_FIELDS
+                    if stored[field] != current[field]
+                ]
+                if changed:
+                    raise TransferImmutableError(
+                        'A transfer destination, narration and transaction '
+                        'cannot be changed after preparation.',
+                        details={'fields': sorted(changed)},
+                    )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TransferImmutableError(
+            'Transfers are permanent history and cannot be deleted.'
         )

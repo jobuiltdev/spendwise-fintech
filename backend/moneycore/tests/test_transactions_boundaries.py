@@ -115,8 +115,8 @@ class TestNoProviderIntegration:
 # ---------------------------------------------------------------------------
 
 
-class TestNoTransferOrRecipientConcepts:
-    def test_the_app_declares_exactly_the_models_through_m4(self):
+class TestNoProviderOrRecipientConcepts:
+    def test_the_app_declares_exactly_the_models_through_m5(self):
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
 
         assert declared == {
@@ -124,15 +124,16 @@ class TestNoTransferOrRecipientConcepts:
             'LedgerAccount', 'Journal', 'JournalEntry',
             'FundsHold',
             'FinancialTransaction',
+            'Transfer',
         }
 
-    def test_no_m5_or_later_model_exists(self):
+    def test_no_m6_or_later_model_exists(self):
         declared = {
             m.__name__.lower() for m in apps.get_app_config('moneycore').get_models()
         }
 
         assert declared.isdisjoint({
-            'transfer', 'transferrequest', 'recipient', 'beneficiary',
+            'transferrequest', 'recipient', 'beneficiary',
             'provider', 'providerattempt', 'webhook', 'webhookevent',
             'reconciliation', 'fee', 'settlement', 'payout', 'card',
             'outboxmessage',
@@ -201,7 +202,7 @@ class TestNoTransferOrRecipientConcepts:
         ):
             assert forbidden not in source
 
-    def test_the_app_has_exactly_four_migrations(self):
+    def test_the_app_has_exactly_five_migrations(self):
         migrations_dir = _moneycore_package() / 'migrations'
         applied = sorted(
             path.stem
@@ -209,7 +210,7 @@ class TestNoTransferOrRecipientConcepts:
             if path.stem != '__init__'
         )
 
-        assert len(applied) == 4
+        assert len(applied) == 5
         assert applied[0] == '0001_initial'
 
     def test_the_earlier_migrations_were_not_rewritten(self):
@@ -218,6 +219,12 @@ class TestNoTransferOrRecipientConcepts:
         for pattern in ('0001_initial.py', '0002_*.py', '0003_*.py'):
             path = next(migrations_dir.glob(pattern))
             assert 'FinancialTransaction' not in path.read_text(encoding='utf-8')
+
+    def test_the_transaction_migration_was_not_rewritten_by_m5(self):
+        migrations_dir = _moneycore_package() / 'migrations'
+        engine = next(migrations_dir.glob('0004_*.py')).read_text(encoding='utf-8')
+
+        assert 'Transfer' not in engine
 
 
 class TestNoDraftOrAbandonmentConcept:
@@ -439,7 +446,8 @@ class TestLegacyExpenseRemainsSeparate:
             if f.related_model is not None
         }
 
-        assert related == {'Wallet', 'FundsHold', 'Journal'}
+        assert related == {'Wallet', 'FundsHold', 'Journal', 'Transfer'}
+        assert 'Expense' not in related
 
     def test_creating_an_expense_creates_no_transaction(self, ledger_user):
         from datetime import date

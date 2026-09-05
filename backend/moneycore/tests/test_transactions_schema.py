@@ -56,15 +56,38 @@ class TestSchema:
         for field in FinancialTransaction._meta.get_fields():
             assert not isinstance(field, (dj.FloatField, dj.DecimalField))
 
-    def test_no_provider_or_transfer_field_exists(self):
-        names = {f.name for f in FinancialTransaction._meta.get_fields()}
+    def test_the_transaction_table_stores_no_provider_or_transfer_column(self):
+        """M4 asserted this across every field; M5 narrows it to real columns.
 
-        assert names.isdisjoint({
+        M5 added ``Transfer.financial_transaction``, so a *reverse* accessor
+        named ``transfer`` now exists. The column lives on the transfer, which
+        is the direction that matters: a financial transaction still knows
+        nothing about transfers and stays usable for future non-transfer
+        operations.
+        """
+        columns = {f.name for f in FinancialTransaction._meta.concrete_fields}
+
+        assert columns.isdisjoint({
             'provider', 'provider_reference', 'provider_status', 'provider_id',
             'recipient', 'beneficiary', 'bank', 'bank_code', 'account_number',
             'transfer', 'transfer_id', 'webhook', 'webhook_id', 'settlement',
             'settlement_id', 'fee', 'fee_minor', 'reconciliation',
+            'destination_account_number', 'destination_bank_code', 'narration',
         })
+
+    def test_the_reverse_transfer_link_is_the_only_one_m5_added(self):
+        reverse = {
+            f.name
+            for f in FinancialTransaction._meta.get_fields()
+            if f.auto_created and not f.concrete
+        }
+
+        assert reverse == {'transfer'}
+
+    def test_a_transaction_backs_at_most_one_transfer(self):
+        field = FinancialTransaction._meta.get_field('transfer')
+
+        assert field.one_to_one
 
     def test_no_balance_field_exists_on_any_model(self):
         forbidden = {
