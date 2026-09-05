@@ -75,14 +75,20 @@ class TestSchema:
             'destination_account_number', 'destination_bank_code', 'narration',
         })
 
-    def test_the_reverse_transfer_link_is_the_only_one_m5_added(self):
+    def test_the_reverse_links_are_exactly_the_transfer_and_its_attempts(self):
+        """M5 added the transfer; M6 added the execution attempts.
+
+        Both columns live on the *other* model, which is the direction that
+        matters: a financial transaction still knows nothing about transfers or
+        providers, and stays usable for future non-transfer operations.
+        """
         reverse = {
             f.name
             for f in FinancialTransaction._meta.get_fields()
             if f.auto_created and not f.concrete
         }
 
-        assert reverse == {'transfer'}
+        assert reverse == {'transfer', 'provider_attempts'}
 
     def test_a_transaction_backs_at_most_one_transfer(self):
         field = FinancialTransaction._meta.get_field('transfer')

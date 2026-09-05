@@ -50,16 +50,18 @@ class TestSchema:
             'narration', 'created_at', 'updated_at',
         }
 
-    def test_the_transfer_model_exists_and_is_the_only_new_one(self):
+    def test_the_transfer_model_exists_alongside_the_declared_set(self):
         from django.apps import apps
 
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
 
+        assert 'Transfer' in declared
         assert declared == {
             'FinancialCustomer', 'FinancialAccount', 'Wallet',
             'LedgerAccount', 'Journal', 'JournalEntry',
             'FundsHold', 'FinancialTransaction',
             'Transfer',
+            'ProviderExecutionAttempt',
         }
 
     def test_it_links_to_exactly_one_financial_transaction(self):

@@ -81,7 +81,12 @@ class TestNoProviderImplementation:
             'settlement', 'settlementbatch', 'payout', 'outboxmessage',
         })
 
-    def test_no_provider_service_module_exists(self):
+    def test_no_provider_adapter_lives_in_the_services_package(self):
+        """M6 added services/provider_execution.py, which is orchestration.
+
+        The adapters themselves live in moneycore/providers/, and nothing that
+        speaks a provider protocol belongs beside the money services.
+        """
         services = _moneycore_package() / 'services'
         names = {path.stem for path in services.glob('*.py')}
 
@@ -440,7 +445,7 @@ class TestNoMobileSurface:
 
 
 class TestMigrations:
-    def test_the_app_has_exactly_five_migrations(self):
+    def test_the_app_has_exactly_six_migrations(self):
         migrations_dir = _moneycore_package() / 'migrations'
         applied = sorted(
             path.stem
@@ -448,9 +453,9 @@ class TestMigrations:
             if path.stem != '__init__'
         )
 
-        assert len(applied) == 5
+        assert len(applied) == 6
         assert applied[0] == '0001_initial'
-        assert applied[-1].startswith('0005_')
+        assert applied[-1].startswith('0006_')
 
     def test_the_earlier_migrations_were_not_rewritten(self):
         migrations_dir = _moneycore_package() / 'migrations'
@@ -543,11 +548,15 @@ class TestEarlierMilestonesUntouched:
             'destination_account_number', 'destination_bank_code',
         })
 
-    def test_the_only_new_link_is_the_reverse_transfer_accessor(self):
+    def test_the_reverse_links_are_the_transfer_and_its_provider_attempts(self):
+        """M5 asserted the transfer alone; M6 added execution attempts.
+
+        Still no *column* on FinancialTransaction for either.
+        """
         reverse = {
             f.name
             for f in FinancialTransaction._meta.get_fields()
             if f.auto_created and not f.concrete
         }
 
-        assert reverse == {'transfer'}
+        assert reverse == {'transfer', 'provider_attempts'}

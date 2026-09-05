@@ -41,6 +41,7 @@ from django.utils import timezone
 from moneycore.domain.errors import (
     HoldImmutableError,
     JournalImmutableError,
+    ProviderAttemptImmutableError,
     TransactionIntentImmutableError,
     TransferImmutableError,
 )
@@ -52,6 +53,12 @@ from moneycore.domain.transactions import (
 )
 from moneycore.domain.transactions import is_terminal as transaction_is_terminal
 from moneycore.domain.money import Money
+from moneycore.domain.providers import (
+    CLIENT_REFERENCE_MAX_LENGTH,
+    PROVIDER_REFERENCE_MAX_LENGTH,
+    ProviderAttemptStatus,
+    ProviderOperation,
+)
 from moneycore.domain.transfers import (
     ACCOUNT_NAME_MAX_LENGTH,
     BANK_CODE_MAX_LENGTH,
@@ -1111,4 +1118,251 @@ class Transfer(models.Model):
     def delete(self, *args, **kwargs):
         raise TransferImmutableError(
             'Transfers are permanent history and cannot be deleted.'
+        )
+
+
+# ===========================================================================
+# M6: the provider execution boundary
+# ===========================================================================
+# A ProviderExecutionAttempt records ONE interaction with an external execution
+# rail, and what that interaction observed. It is not a second business
+# lifecycle: FinancialTransaction remains the only authoritative status, and
+# Transfer still reads its status from there.
+#
+# Nothing here stores a raw provider payload, HTTP status, header, response
+# body, stack trace or credential. What crosses the boundary is already
+# normalised; what does not normalise is ambiguity, which is a status, not a
+# blob.
+
+
+class ProviderExecutionAttemptQuerySet(models.QuerySet):
+    """Refuses the bulk paths that would rewrite a finished observation."""
+
+    def _finished_rows_present(self) -> bool:
+        return self.filter(
+            status__in=sorted(ProviderAttemptStatus.FINISHED)
+        ).exists()
+
+    def update(self, **kwargs):
+        if self._finished_rows_present():
+            raise ProviderAttemptImmutableError(
+                'Finished provider attempts cannot be updated in bulk.'
+            )
+        return super().update(**kwargs)
+
+    def delete(self):
+        raise ProviderAttemptImmutableError(
+            'Provider attempts are permanent history and cannot be deleted.'
+        )
+
+
+class ProviderExecutionAttempt(models.Model):
+    """One interaction with an external execution rail.
+
+    Created **before** the outbound call and committed, so a durable record of
+    the claim exists no matter what happens next. That row is also what makes
+    duplicate submission impossible: a unique constraint on the transaction
+    means a second execute call cannot create a second claim.
+
+    The crash window, stated honestly
+    ---------------------------------
+    ``STARTED`` means *the attempt was claimed and may or may not have reached
+    the provider*. Two different crashes leave the same row:
+
+    * the process died after this row committed but before the call was made —
+      nothing was sent;
+    * the process died after the call was made but before the outcome was
+      written — the request may have been received and executed.
+
+    **M6 does not distinguish them, and no state could.** Recording
+    "submitted" would require a database write that is atomic with a network
+    send, which is not achievable; any such marker would only narrow the window
+    while inviting the dangerous inference that a ``STARTED`` row definitely
+    was not sent. So there is one pre-outcome state, and its documented meaning
+    is the conservative one.
+
+    That conservatism is safe because it forces the only correct recovery
+    behaviour for *both* crashes: do not resubmit, do not conclude failure, go
+    and establish what actually happened. M6 therefore never converts
+    ``STARTED`` into a failure and never resubmits. Establishing the truth —
+    status query, webhook, reconciliation — is M7's, and is the reason M7
+    exists.
+
+    ``UNKNOWN`` is different from ``STARTED``: the interaction finished and
+    told us nothing conclusive. Both mean "go and find out", but they are
+    different observations and are not collapsed.
+    """
+
+    #: Fixed once written. What was attempted never changes.
+    CLAIM_FIELDS = (
+        'financial_transaction_id',
+        'provider_key',
+        'operation',
+        'client_reference',
+    )
+
+    financial_transaction = models.ForeignKey(
+        FinancialTransaction,
+        on_delete=models.PROTECT,
+        related_name='provider_attempts',
+    )
+    #: A stable internal key ("simulator"), never a vendor brand. No provider
+    #: partner has been chosen (D-1).
+    provider_key = models.CharField(max_length=64)
+    operation = models.CharField(
+        max_length=32,
+        choices=ProviderOperation.CHOICES,
+        default=ProviderOperation.SUBMIT_TRANSFER,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=ProviderAttemptStatus.CHOICES,
+        default=ProviderAttemptStatus.STARTED,
+    )
+    #: Our outbound reference for this interaction. Deterministic, immutable,
+    #: and never the provider's own reference.
+    client_reference = models.CharField(max_length=CLIENT_REFERENCE_MAX_LENGTH)
+    #: Whatever the rail called it. Optional on every status: a provider may
+    #: return one on success, on failure, or even alongside an ambiguous
+    #: response, and may equally return none at all.
+    provider_reference = models.CharField(
+        max_length=PROVIDER_REFERENCE_MAX_LENGTH, blank=True
+    )
+    #: Normalised and provider-neutral. Set only when status is FAILED — an
+    #: ambiguous outcome is not a failure and never borrows this column.
+    failure_code = models.CharField(max_length=64, blank=True)
+    #: A short operator note for an ambiguous outcome. Deliberately a separate
+    #: column from failure_code so the two can never be confused.
+    ambiguity_reason = models.CharField(max_length=64, blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = ProviderExecutionAttemptQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'provider execution attempt'
+        verbose_name_plural = 'provider execution attempts'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(status__in=sorted(ProviderAttemptStatus.ALL)),
+                name='moneycore_attempt_status_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(operation__in=sorted(ProviderOperation.ALL)),
+                name='moneycore_attempt_operation_valid',
+            ),
+            models.CheckConstraint(
+                check=~models.Q(provider_key=''),
+                name='moneycore_attempt_provider_key_present',
+            ),
+            models.CheckConstraint(
+                check=~models.Q(client_reference=''),
+                name='moneycore_attempt_client_reference_present',
+            ),
+            # One attempt per transaction. M6 has no retry, so this is the
+            # database-level guarantee that a transfer cannot be submitted
+            # twice. Relaxing it belongs to whichever milestone actually
+            # designs retry semantics.
+            models.UniqueConstraint(
+                fields=['financial_transaction'],
+                name='moneycore_attempt_one_per_transaction',
+            ),
+            # A finished attempt records when; an unfinished one does not.
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        status__in=sorted(ProviderAttemptStatus.FINISHED),
+                        finished_at__isnull=False,
+                    )
+                    | (
+                        ~models.Q(
+                            status__in=sorted(ProviderAttemptStatus.FINISHED)
+                        )
+                        & models.Q(finished_at__isnull=True)
+                    )
+                ),
+                name='moneycore_attempt_finished_at_matches_status',
+            ),
+            # Only a definitive failure carries a failure code. In particular
+            # an ambiguous outcome cannot borrow one.
+            models.CheckConstraint(
+                check=(
+                    models.Q(status=ProviderAttemptStatus.FAILED)
+                    | models.Q(failure_code='')
+                ),
+                name='moneycore_attempt_failure_code_only_when_failed',
+            ),
+            # And only an ambiguous outcome carries an ambiguity reason.
+            models.CheckConstraint(
+                check=(
+                    models.Q(status=ProviderAttemptStatus.UNKNOWN)
+                    | models.Q(ambiguity_reason='')
+                ),
+                name='moneycore_attempt_ambiguity_only_when_unknown',
+            ),
+        ]
+        indexes = [
+            # Finding interactions that never reached an outcome — the crash
+            # window above, which M7 recovery will need to sweep.
+            models.Index(fields=['status', 'started_at']),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'ProviderExecutionAttempt<{self.pk}: {self.provider_key} '
+            f'{self.operation} txn {self.financial_transaction_id} '
+            f'{self.status}>'
+        )
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status in ProviderAttemptStatus.FINISHED
+
+    @property
+    def may_have_been_submitted(self) -> bool:
+        """Whether this attempt might already have moved money.
+
+        True for a claimed-but-unfinished attempt as well as an ambiguous one:
+        both mean "do not resubmit, go and find out". Deliberately never False
+        for ``STARTED`` — see the crash-window note above.
+        """
+        return self.status in {
+            ProviderAttemptStatus.STARTED,
+            ProviderAttemptStatus.UNKNOWN,
+            ProviderAttemptStatus.SUCCEEDED,
+        }
+
+    def _stored(self):
+        return (
+            ProviderExecutionAttempt.objects.filter(pk=self.pk)
+            .values('status', *self.CLAIM_FIELDS)
+            .first()
+        )
+
+    def save(self, *args, **kwargs):
+        """Refuse to rewrite the claim, or to reopen a finished observation."""
+        if self.pk is not None:
+            stored = self._stored()
+            if stored is not None:
+                changed = [
+                    field for field in self.CLAIM_FIELDS
+                    if stored[field] != getattr(self, field)
+                ]
+                if changed:
+                    raise ProviderAttemptImmutableError(
+                        'What a provider attempt recorded cannot be changed.',
+                        details={'fields': sorted(changed)},
+                    )
+                if stored['status'] in ProviderAttemptStatus.FINISHED:
+                    raise ProviderAttemptImmutableError(
+                        'That provider attempt has already finished.',
+                        details={'attempt': self.pk, 'status': stored['status']},
+                    )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ProviderAttemptImmutableError(
+            'Provider attempts are permanent history and cannot be deleted.'
         )

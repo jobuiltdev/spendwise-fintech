@@ -877,6 +877,94 @@ outbox, scheduled or recurring transfers, transfer drafts, cancellation, a
 saved beneficiary, and any mutable balance. No legacy `Expense` gained a
 transfer, and no transfer references one.
 
+## 17G. Decisions closed in M6 — provider abstraction and simulator
+
+M6 answers a fifth question: *how does SpendWise ask an external rail to execute
+a transfer, and how does it truthfully read the immediate answer?* It does not
+answer how an unresolved answer is later resolved — that is M7, and the honesty
+of M6 depends on not pretending otherwise.
+
+The milestone exists for its third outcome. Success and failure are
+straightforward; the case that decides whether a payment system is trustworthy
+is the one where the rail stops answering after the request went out.
+
+| # | Decision | Detail |
+|---|---|---|
+| M6-1 | **Five concepts, five modules** | Journal = what posted (M2). Hold = what is reserved (M3). FinancialTransaction = the lifecycle (M4). Transfer = business intent (M5). **ProviderExecutionAttempt = one interaction with an external rail (M6).** An attempt is an *observation*, not a second business lifecycle. |
+| M6-2 | **FinancialTransaction remains the only authoritative status** | Attempt status maps into it — succeeded → SUCCEEDED, failed → FAILED, unknown → UNKNOWN — but the attempt is never the customer-facing source. `Transfer.status` still reads through to the transaction, and every state change goes through M4/M5's existing services. M6 assigns no transaction status directly and implements no second state machine. |
+| M6-3 | **Four attempt states: `started`, `succeeded`, `failed`, `unknown`** | No `pending`, `processing`, `submitted`, `settling`, `confirming`, `reversed` or `reconciled` — each of those would be a second business lifecycle. `UNKNOWN` **is** terminal for an *attempt* while remaining non-terminal for a *transaction*: the interaction is over and told us nothing conclusive, but the operation is still waiting for the truth. |
+| M6-4 | **Three outcomes, and ambiguity has its own type** | `ProviderTransferSucceeded`, `ProviderTransferFailed`, `ProviderTransferUnknown`. Impossible states are unrepresentable rather than merely validated: a success carries no `failure_code` because the class has no such field, and an ambiguous result cannot claim success because it is a different type. **There is no boolean success flag anywhere** — a bool cannot distinguish "definitely not" from "we do not know", which is precisely the distinction that matters. An adapter returning anything else raises `provider_result_invalid`. |
+| M6-5 | **Timeout is not failure, and there is no code that could express one** | The normalised failure vocabulary is four values — `destination_rejected`, `request_rejected`, `provider_unavailable`, `unknown_provider_failure` — and contains **no `timeout` member**, so recording one is not possible. A lost response, dropped connection or unanswered request is `ProviderTransferUnknown`. This closes O-24 only as far as M6 can justify; the vocabulary stays deliberately tiny. |
+| M6-6 | **Ambiguity keeps the reservation** | UNKNOWN posts no journal, releases no hold and moves no balance. The customer's funds stay reserved precisely because the money may already have gone. This is the strongest invariant in the milestone. |
+| M6-7 | **`failure_code` and `ambiguity_reason` are separate columns, enforced by the database** | Two check constraints: only a FAILED attempt may carry a failure code, and only an UNKNOWN attempt may carry an ambiguity reason. An ambiguous outcome cannot borrow a failure code even by raw SQL. |
+| M6-8 | **The provider call happens outside every database transaction** | Non-negotiable. Execution is three phases — an atomic claim, the call, an atomic outcome — and the middle holds no transaction and no row lock. M3 made the wallet row the serialisation gate for all spendability; a call inside `atomic` would hold that lock for the duration of somebody else's outage, stalling every other operation on that customer's money behind a hung socket. Proved **at runtime** by asserting `connection.in_atomic_block is False` during the call, on a connection pytest-django has not wrapped — not by reading the source. |
+| M6-9 | **The durable attempt row, committed before the call, is the execution claim** | Written and committed in phase one, with a unique constraint on the transaction. That single row is what makes duplicate submission impossible, and it is why the claim must be durable *before* anything is sent rather than after. |
+| M6-10 | **One attempt per transaction, at the database level** | A `UniqueConstraint` on `financial_transaction`. M6 has no retry, so exactly one attempt is correct; relaxing it belongs to whichever milestone actually designs retry semantics. No `attempt_number` was invented, because with no retry it would describe nothing. |
+| M6-11 | **Executing twice is refused, never resubmitted** | A second `execute_transfer` raises `provider_execution_already_started` whatever the first attempt's state — including UNKNOWN. Resending a request whose outcome is unresolved is how a customer gets debited twice. |
+| M6-12 | **No retry, no backoff, no loop, anywhere** | The service calls `submit_transfer` from exactly one place, proved by walking its AST rather than grepping prose. There is no sleep, no loop and no scheduler. |
+| M6-13 | **Provider success alone does not make a transaction succeed** | Success still runs M5's transfer accounting and M4's atomic hold release and journal posting. If that accounting is rejected, the whole outcome phase rolls back and the attempt stays unfinished rather than claiming a success with no posted truth behind it. |
+| M6-14 | **The counterpart account is still supplied by the caller** | M6 invents no settlement account either. O-29 stays open. |
+| M6-15 | **The request carries business values only** | `ProviderTransferRequest` is a frozen dataclass of amount, currency, destination, client reference and narration. **No Django model instance crosses the boundary** — no wallet, transfer, transaction, hold, journal or user — so an adapter cannot reach back into the money core, and adding a provider cannot quietly become a way to mutate financial state. |
+| M6-16 | **The outbound client reference is ours, deterministic, and not a sequence** | `SW-` plus a digest of immutable transaction identity. Stable across repeated reads, so a replayed read never invents a new one, and the database sequence is not published to a third party. It is not the transfer id, not M4's idempotency key, and not the provider's reference — depending on a provider's numbering for our own correctness would be backwards. |
+| M6-17 | **The provider reference lives on the attempt, and is optional on every status** | Never on `Transfer` and never on `FinancialTransaction`. Opaque and bounded: no assumption that it is numeric, a UUID or any fixed length; outer whitespace trimmed, control characters refused. A rail may return one on success, on failure, alongside an ambiguous answer, or not at all. |
+| M6-18 | **A finished attempt is immutable** | Never rewritten, and specifically never `unknown → succeeded` on the same row. An attempt records what one interaction observed; later evidence is *new* evidence about the transaction, and recording it is M7's recovery, not an edit of history. Model `save()` refuses reopening, queryset `update()` refuses when finished rows are in scope, and deletion is refused outright. |
+| M6-19 | **Nothing raw is persisted** | No response body, request body, payload, header, HTTP status, URL, credential, signature or stack trace — asserted field by field. What crosses the boundary is already normalised; what does not normalise is ambiguity, which is a status, not a blob. |
+| M6-20 | **The adapter interface is two methods** | `resolve_bank_account` and `submit_transfer`. No status query, no webhook hook, no `do_everything`. Adding a recovery hook here would invite M6 to start guessing at exactly the point where it must not. |
+| M6-21 | **Account resolution is the trusted producer M5 deliberately left absent** | `resolve_transfer_destination` converts a provider-neutral `ProviderAccountResolution` into M5's `VerifiedBankAccount`, so no provider shape ever reaches a `Transfer`. M5's own validation still applies, so a rail returning a malformed account number is refused. **It opens no database transaction and persists nothing** — resolving a destination moves no money and creates no intent. |
+| M6-22 | **"Not found" and "could not check" are different errors** | `account_resolution_not_found` and `account_resolution_unavailable`, neither a subclass of the other. Telling a customer their recipient's account does not exist because *our* rail was unreachable would state a fact nobody established. |
+| M6-23 | **The simulator is deterministic and says what it is** | `provider_key = 'simulator'`. No randomness, no sleeping, no I/O, no global mutable state; the provider reference is derived from the caller's own client reference, so the same demo reproduces exactly. Outcome comes from an explicitly configured scenario — **no magic account numbers**, because a fixture that looks like real data is how fake behaviour escapes into a real system. |
+| M6-24 | **The simulator's bank fixture is not a directory** | Three `SIM-` codes so a demo resolution reads plausibly. Simulator-local, not production metadata, and no `Bank` model exists. O-28 stays open. |
+| M6-25 | **"Unreachable before submission" is a definitive failure, kept sharply apart from ambiguity** | Only ever safe to say when the adapter can actually prove nothing left. The simulator models it explicitly so the distinction is exercised rather than assumed. |
+| M6-26 | **No provider registry framework** | The provider is a parameter on every entry point. No global, no configured default, no plugin loader, nothing to misconfigure. With only a simulator, anything more would be architecture for its own sake. |
+| M6-27 | **Lock order unchanged, taken explicitly in both phases** | The canonical order is **Wallet rows (ascending PK) → FinancialTransaction → ProviderExecutionAttempt → hold / transfer / ledger work**, and both database phases take it in full themselves. The transaction lock is acquired by M6 directly rather than left to the nested M4/M5 service it calls: by the time that service runs, the attempt row would already be held and the order would be inverted. This matters beyond M6 — a future recovery sweep may legitimately lock a transaction and its attempt **without** needing the wallet, and an inverted outcome path would form a cycle with it. M6's own wallet lock serialises its own callers, so such an inversion would not surface in M6's concurrency tests; it would appear later as an intermittent deadlock in M7. The order is proved by spying on the issued `FOR UPDATE` statements, scoped per phase. Nested M4/M5 calls re-request the wallet and transaction rows this transaction already holds, which acquires nothing and creates no new ordering edge. **No wallet lock is ever held across a provider call.** |
+| M6-28 | **No webhook, no status polling, no reconciliation, no queue, no public API** | None of it exists, asserted by test. No Celery, no Redis, no outbox, no scheduled sweep. No execution or resolution route is registered for GET or POST, and the M1 `GET /api/financial-account/` response is unchanged and leaks nothing about an attempt. |
+| M6-29 | **No real provider, and no configuration for one** | No vendor brand anywhere in the money core, no HTTP client imported, no SDK, and no `PROVIDER_API_KEY`, `PROVIDER_SECRET`, `PROVIDER_BASE_URL` or `PROVIDER_TIMEOUT` setting. A timeout value would be a guess about a partner who has not been chosen (D-1). |
+
+### The crash window — stated honestly
+
+`STARTED` means *the attempt was claimed and may or may not have reached the
+provider*. Two different crashes leave exactly the same row:
+
+* **A** — the process died after the claim committed but before the call was
+  made. Nothing was sent.
+* **B** — the process died after the call was made but before the outcome was
+  written. The request may have been received and executed.
+
+**M6 does not distinguish them, and no attempt state could.** Recording a
+"submitted" marker would require a database write that is atomic with a network
+send, which is not achievable — any such marker would only narrow the window
+while inviting the dangerous inference that a `STARTED` row definitely was not
+sent. So there is one pre-outcome state, and its documented meaning is the
+conservative one: `may_have_been_submitted` is `True` for `STARTED`.
+
+That conservatism is safe because it forces the only correct behaviour for
+*both* crashes: **do not resubmit, do not conclude failure, go and establish
+what actually happened.** In case A a status query returns "not found" and
+resolves safely; in case B it is the only way to learn the truth at all. The
+cost of treating A as possibly-submitted is one wasted query; the cost of the
+opposite mistake is sending a customer's money twice.
+
+M6 therefore never converts `STARTED` into a failure, never resubmits, and
+provides no recovery entry point. An index on `(status, started_at)` exists so
+M7 can find these rows. **Establishing the truth is M7's, and is the reason M7
+exists.**
+
+`STARTED` and `UNKNOWN` are not collapsed: the first is an unfinished
+interaction, the second a finished one that told us nothing conclusive. Both
+mean "go and find out", but they are different observations and are recorded
+differently.
+
+### What M6 deliberately did not build
+
+A real provider integration, provider credentials or configuration, a vendor
+SDK, an HTTP client, a bank directory, a `Bank` model, webhooks, webhook
+signature validation, status polling, UNKNOWN resolution or recovery,
+reconciliation, settlement, a retry policy or scheduler, a provider registry or
+plugin framework, an outbox, Celery, Redis, an `attempt_number`, a customer
+execution or resolution API, transaction PIN, KYC, risk, fees, limits, and any
+mobile change. No legacy `Expense` gained a provider attempt, and no attempt
+references one.
+
 ---
 
 ## 18. Deferred and open register
@@ -921,7 +1009,7 @@ transfer, and no transfer references one.
 | O-21 | Whether hold release gains idempotent retry semantics. **Narrowed by M4, not closed:** M4 introduced idempotency at the level of *transaction intent* only, and deliberately did not extend it to hold release, which still raises `hold_not_active` on a second call | §17D M3-13, §17E M4-16 |
 | O-22 | **How an UNKNOWN transaction is eventually resolved.** M4 makes the state safe, persistent and reservation-preserving, but nothing in M4 resolves one: whether resolution arrives by provider polling, webhook, reconciliation sweep or manual operations is M6/M7 | §17E M4-5, M4-7 |
 | O-23 | How long a transaction may remain UNKNOWN before operational escalation, and what that escalation is. M4 imposes no time limit — an unresolved operation stays unresolved rather than being concluded on a timer | §17E M4-5 |
-| O-24 | The `failure_code` vocabulary. M4 stores a normalised internal code but defines no values; provider errors are first mapped in M6 | §17E M4-22 |
+| O-24 | The `failure_code` vocabulary. **Narrowed by M6, not closed:** a deliberately tiny provider-neutral set of four values now exists (`destination_rejected`, `request_rejected`, `provider_unavailable`, `unknown_provider_failure`), with **no ambiguous condition expressible as a failure**. Whether it needs to grow depends on a real rail's error space (O-40) | §17E M4-22, §17G M6-5 |
 | O-25 | **Transfer fee policy** — whether a fee exists, whether it is reserved with the principal, its account taxonomy, its disclosure and its settlement. **Narrowed by M5, not closed:** M5 reserves and posts the principal only, while leaving M4's structural allowance for a hold larger than the principal intact, so a fee policy fits later without reopening either milestone | §17E M4-14, §17F M5-18 |
 | O-26 | Whether and how transaction state is exposed to product surfaces, and what shape that takes. M4 exposes none | §17E M4-23 |
 | O-27 | The fresh-intent policy for a new operation after a terminal failure — whether the product generates a fresh idempotency key or requires the caller to. `FAILED` is terminal and remains historical; M4 requires a new key for a genuinely new attempt, which is what stops a retry loop from spending twice, and **invents no retry semantics of its own**. M5 defines the policy | §17E M4-16 |
@@ -931,7 +1019,13 @@ transfer, and no transfer references one.
 | O-31 | Whether persisted pre-acceptance drafts are ever needed in the product, and where they would live. They would belong to the transfer/product layer, never to the money transaction engine | §17F M5-12 |
 | O-32 | Whether saved beneficiaries become a product feature, and their edit and re-verification policy. M5 needs none: transfer history is a snapshot and is unaffected either way | §17F M5-5 |
 | O-33 | Narration rules if they turn out to be product- or rail-dependent — permitted characters, length, and whether it reaches the receiving bank at all. M5 bounds it conservatively and sends it nowhere | §17F M5-26 |
-| O-34 | Account-verification provider and its timeout behaviour. M5 models the verified fact and implements no way to obtain it | §17F M5-6 |
+| O-34 | Account-verification provider and its timeout behaviour. **Narrowed by M6:** a provider-neutral resolution boundary now exists and the simulator satisfies it, so `VerifiedBankAccount` finally has a trusted producer. **Which real provider performs it, and how it behaves under timeout, stays open** | §17F M5-6, §17G M6-21 |
+| O-35 | **UNKNOWN resolution strategy.** M6 makes ambiguity safe, persistent and reservation-preserving, but resolves nothing: whether truth arrives by status query, webhook, reconciliation sweep or manual operations is M7 | §17G M6-6, crash window |
+| O-36 | **Crash-window recovery policy.** How M7 sweeps `STARTED` attempts, how long it waits, and what it does when a status query is itself ambiguous. M6 records the rows and refuses to guess | §17G crash window |
+| O-37 | Provider timeout values and transport configuration. No partner exists, so any number would be a guess | §17G M6-29 |
+| O-38 | Provider retry rules, if a rail's own idempotency guarantees ever make a safe resubmission possible. M6 forbids retry outright | §17G M6-11, M6-12 |
+| O-39 | Webhook signature validation and inbound-event idempotency | §17G M6-28 |
+| O-40 | Whether the normalised failure vocabulary needs to grow once a real rail's error space is known. M6 defined four values and no more | §17G M6-5 |
 | O-2 | Rounding mode and remainder allocation for authoritative money | §7 |
 | O-3 | Reports' eventual placement | §12 |
 | O-4 | Whether NativeTabs can achieve the target glass treatment on the pinned Expo version | §13.1 |

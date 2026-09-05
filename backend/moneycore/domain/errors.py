@@ -603,3 +603,108 @@ class TransferImmutableError(TransferError, ConflictError):
         'A transfer\'s destination, narration and transaction cannot be '
         'changed after preparation.'
     )
+
+
+# ===========================================================================
+# M6: the provider execution boundary
+# ===========================================================================
+# The provider domain owns how SpendWise asks an external rail to execute and
+# how it reads the immediate answer. No error here carries a vendor name, a raw
+# payload, an HTTP status, a header or a credential: what reaches this layer is
+# already normalised, and what does not normalise is ambiguity, not an error.
+
+
+class ProviderError(DomainError):
+    """Base class for every provider-boundary failure."""
+
+    code = 'provider_execution_error'
+    default_message = 'The transfer could not be submitted for execution.'
+
+
+class ProviderExecutionAlreadyStartedError(ProviderError, ConflictError):
+    """This transfer has already been submitted for execution.
+
+    The durable attempt row is the execution claim, so a second execute call is
+    refused rather than resubmitted. **Never retry past this**: an earlier
+    attempt whose outcome is unresolved may already have moved money, and
+    sending again is how a customer gets debited twice. Establishing what
+    actually happened is recovery, which is M7.
+    """
+
+    code = 'provider_execution_already_started'
+    default_message = (
+        'That transfer has already been submitted to a provider.'
+    )
+
+
+class ProviderResultInvalidError(ProviderError, ValidationError):
+    """An adapter returned something that is not an honest outcome.
+
+    A provider adapter must return a definitive success, a definitive failure,
+    or an explicit unknown. Anything else — ``None``, a bare boolean, a dict, a
+    success carrying a failure code — has not told us what happened, and
+    guessing on its behalf is how ambiguity becomes a fabricated failure.
+    """
+
+    code = 'provider_result_invalid'
+    default_message = 'That provider result is not a valid outcome.'
+
+
+class ProviderAttemptImmutableError(ProviderError, ConflictError):
+    """An attempt records what one interaction observed, and that is fixed.
+
+    A finished attempt is never rewritten — not even from ``unknown`` to
+    ``succeeded``. Later evidence is new evidence about the *transaction*, and
+    recording it belongs to M7's recovery, not to editing history here.
+    """
+
+    code = 'provider_attempt_immutable'
+    default_message = (
+        'A finished provider attempt cannot be changed or deleted.'
+    )
+
+
+class ProviderAttemptNotFoundError(ProviderError, NotFoundError):
+    """No provider attempt exists for that transfer."""
+
+    code = 'provider_attempt_not_found'
+    default_message = 'That transfer has no provider attempt.'
+
+
+class ProviderAttemptInvalidStateError(ProviderError, ConflictError):
+    """The attempt is not in a state that permits this operation."""
+
+    code = 'provider_attempt_invalid_state'
+    default_message = 'That provider attempt is not in a usable state.'
+
+
+class AccountResolutionNotFoundError(ProviderError, NotFoundError):
+    """The rail reported that no such account exists.
+
+    Strictly distinct from :class:`AccountResolutionUnavailableError`: telling
+    a customer their recipient's account does not exist because *our* provider
+    was unreachable would state a fact nobody established.
+    """
+
+    code = 'account_resolution_not_found'
+    default_message = 'That account could not be found at that bank.'
+
+
+class AccountResolutionUnavailableError(ProviderError, ProviderUnavailableError):
+    """The destination could not be checked right now.
+
+    Says nothing about whether the account exists. Retrying a *resolution* is
+    safe — it moves no money — but M6 does not retry on the caller's behalf.
+    """
+
+    code = 'account_resolution_unavailable'
+    default_message = (
+        'That account could not be verified right now. Nothing was sent.'
+    )
+
+
+class AccountResolutionInvalidError(ProviderError, ValidationError):
+    """The resolution request itself was malformed."""
+
+    code = 'account_resolution_invalid'
+    default_message = 'That account could not be looked up as given.'
