@@ -24,7 +24,7 @@ def _backend_root():
     return Path(moneycore.__file__).resolve().parents[1]
 
 
-class TestNoM8OrLaterConcepts:
+class TestNoM9OrLaterConcepts:
     """Transfers, recipients and providers are later milestones.
 
     M2 wrote these to exclude holds and transactions as well; M3 introduced the
@@ -32,7 +32,7 @@ class TestNoM8OrLaterConcepts:
     now expected and the guard has moved forward to M5.
     """
 
-    def test_the_app_declares_exactly_the_models_through_m7(self):
+    def test_the_app_declares_exactly_the_models_through_m8(self):
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
 
         assert declared == {
@@ -44,9 +44,10 @@ class TestNoM8OrLaterConcepts:
             'ProviderExecutionAttempt',
             'ProviderRecoveryEvidence',
             'ProviderWebhookEvent',
+            'ProviderReconciliationRun', 'ProviderReconciliationItem',
         }
 
-    def test_no_m8_or_later_model_exists(self):
+    def test_no_m9_or_later_model_exists(self):
         declared = {
             m.__name__.lower() for m in apps.get_app_config('moneycore').get_models()
         }

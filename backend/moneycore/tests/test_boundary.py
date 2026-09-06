@@ -36,8 +36,9 @@ class TestSchemaMatchesTheCurrentMilestone:
     M5_MODELS = {'Transfer'}
     M6_MODELS = {'ProviderExecutionAttempt'}
     M7_MODELS = {'ProviderRecoveryEvidence', 'ProviderWebhookEvent'}
+    M8_MODELS = {'ProviderReconciliationRun', 'ProviderReconciliationItem'}
 
-    def test_the_app_declares_exactly_the_models_through_m7(self):
+    def test_the_app_declares_exactly_the_models_through_m8(self):
         declared = {
             model.__name__ for model in apps.get_app_config('moneycore').get_models()
         }
@@ -45,10 +46,10 @@ class TestSchemaMatchesTheCurrentMilestone:
         assert declared == (
             self.M1_MODELS | self.M2_MODELS | self.M3_MODELS
             | self.M4_MODELS | self.M5_MODELS | self.M6_MODELS
-            | self.M7_MODELS
+            | self.M7_MODELS | self.M8_MODELS
         )
 
-    def test_no_m8_or_later_model_has_appeared(self):
+    def test_no_m9_or_later_model_has_appeared(self):
         declared = {
             model.__name__.lower()
             for model in apps.get_app_config('moneycore').get_models()
@@ -76,7 +77,7 @@ class TestSchemaMatchesTheCurrentMilestone:
         applied = sorted(
             path.stem for path in migrations_dir.glob('*.py') if path.stem != '__init__'
         )
-        assert len(applied) == 7
+        assert len(applied) == 8
         assert applied[0] == '0001_initial'
 
     def test_the_m1_migration_was_not_rewritten(self):
@@ -96,6 +97,7 @@ class TestSchemaMatchesTheCurrentMilestone:
         assert 'Transfer' not in initial
         assert 'ProviderExecutionAttempt' not in initial
         assert 'ProviderRecoveryEvidence' not in initial
+        assert 'ProviderReconciliationRun' not in initial
 
     def test_the_m2_migration_was_not_rewritten(self):
         """Committed migration history stays append-only."""
@@ -110,6 +112,7 @@ class TestSchemaMatchesTheCurrentMilestone:
         assert 'Transfer' not in ledger
         assert 'ProviderExecutionAttempt' not in ledger
         assert 'ProviderRecoveryEvidence' not in ledger
+        assert 'ProviderReconciliationRun' not in ledger
 
     def test_the_m3_migration_was_not_rewritten(self):
         """Committed migration history stays append-only."""
@@ -123,6 +126,7 @@ class TestSchemaMatchesTheCurrentMilestone:
         assert 'Transfer' not in holds
         assert 'ProviderExecutionAttempt' not in holds
         assert 'ProviderRecoveryEvidence' not in holds
+        assert 'ProviderReconciliationRun' not in holds
 
     def test_the_m4_migration_was_not_rewritten(self):
         """Committed migration history stays append-only."""
@@ -135,6 +139,7 @@ class TestSchemaMatchesTheCurrentMilestone:
         assert 'Transfer' not in engine
         assert 'ProviderExecutionAttempt' not in engine
         assert 'ProviderRecoveryEvidence' not in engine
+        assert 'ProviderReconciliationRun' not in engine
 
 
 class TestDomainImports:
@@ -185,3 +190,4 @@ class TestNotWiredIntoLegacyBehaviour:
 
         assert 'ProviderExecutionAttempt' not in transfers
         assert 'ProviderRecoveryEvidence' not in transfers
+        assert 'ProviderReconciliationRun' not in transfers

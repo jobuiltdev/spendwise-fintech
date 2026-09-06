@@ -43,6 +43,8 @@ from moneycore.domain.errors import (
     JournalImmutableError,
     ProviderAttemptImmutableError,
     ProviderRecoveryEvidenceImmutableError,
+    ReconciliationItemImmutableError,
+    ReconciliationRunImmutableError,
     TransactionIntentImmutableError,
     TransferImmutableError,
 )
@@ -59,6 +61,13 @@ from moneycore.domain.providers import (
     PROVIDER_REFERENCE_MAX_LENGTH,
     ProviderAttemptStatus,
     ProviderOperation,
+)
+from moneycore.domain.reconciliation import (
+    DISCREPANCY_FLAGS,
+    PROVIDER_RECORD_ID_MAX_LENGTH,
+    ReconciliationOutcome,
+    ReconciliationRunStatus,
+    ReconciliationStatus,
 )
 from moneycore.domain.recovery import (
     CLIENT_REFERENCE_LOOKUP_MAX_LENGTH,
@@ -1678,4 +1687,389 @@ class ProviderWebhookEvent(models.Model):
     def delete(self, *args, **kwargs):
         raise ProviderRecoveryEvidenceImmutableError(
             'Webhook receipts are permanent and cannot be deleted.'
+        )
+
+
+# ===========================================================================
+# M8: reconciliation
+# ===========================================================================
+# Two models, both append-only audit history and neither of them financial
+# truth. A reconciliation run is a record of *having looked*; an item is a
+# record of *what was found*. Neither is ever consulted to decide what a
+# customer's balance is — that remains the ledger's job alone.
+#
+# Nothing here stores a raw provider payload. What crosses into the money core
+# is already normalised, and what cannot be normalised fails the run.
+
+
+class ProviderReconciliationRunQuerySet(models.QuerySet):
+    """Finished runs are history; only a started run may still be updated."""
+
+    def _finished_rows_present(self) -> bool:
+        return self.filter(
+            status__in=sorted(ReconciliationRunStatus.TERMINAL)
+        ).exists()
+
+    def update(self, **kwargs):
+        if self._finished_rows_present():
+            raise ReconciliationRunImmutableError(
+                'Finished reconciliation runs cannot be updated in bulk.'
+            )
+        return super().update(**kwargs)
+
+    def delete(self):
+        raise ReconciliationRunImmutableError(
+            'Reconciliation runs are permanent and cannot be deleted.'
+        )
+
+
+class ProviderReconciliationRun(models.Model):
+    """One comparison of a provider's records against internal truth.
+
+    Operational history, not financial truth. Running reconciliation twice over
+    the same window produces **two runs**, deliberately: each is a separate
+    observation made at a separate moment, and a rerun that overwrote the first
+    would destroy the record that the answer had once been different.
+    """
+
+    #: Fixed at creation. What was compared never changes.
+    IDENTITY_FIELDS = ('provider_key', 'window_start', 'window_end')
+
+    provider_key = models.CharField(max_length=64)
+    #: Half-open ``[start, end)``, both timezone-aware, so consecutive windows
+    #: tile without overlap or gap.
+    window_start = models.DateTimeField()
+    window_end = models.DateTimeField()
+    status = models.CharField(
+        max_length=20,
+        choices=ReconciliationRunStatus.CHOICES,
+        default=ReconciliationRunStatus.STARTED,
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = ProviderReconciliationRunQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'provider reconciliation run'
+        verbose_name_plural = 'provider reconciliation runs'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(status__in=sorted(ReconciliationRunStatus.ALL)),
+                name='moneycore_recon_run_status_valid',
+            ),
+            models.CheckConstraint(
+                check=~models.Q(provider_key=''),
+                name='moneycore_recon_run_provider_key_present',
+            ),
+            models.CheckConstraint(
+                check=models.Q(window_end__gt=models.F('window_start')),
+                name='moneycore_recon_run_window_ordered',
+            ),
+            # A finished run records when it finished; a started one does not.
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        status__in=sorted(ReconciliationRunStatus.TERMINAL),
+                        completed_at__isnull=False,
+                    )
+                    | (
+                        ~models.Q(
+                            status__in=sorted(ReconciliationRunStatus.TERMINAL)
+                        )
+                        & models.Q(completed_at__isnull=True)
+                    )
+                ),
+                name='moneycore_recon_run_completed_at_matches_status',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['provider_key', 'window_start']),
+            models.Index(fields=['status', 'started_at']),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'ProviderReconciliationRun<{self.pk}: {self.provider_key} '
+            f'{self.window_start:%Y-%m-%dT%H:%M} .. '
+            f'{self.window_end:%Y-%m-%dT%H:%M} {self.status}>'
+        )
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status in ReconciliationRunStatus.TERMINAL
+
+    def _stored(self):
+        return (
+            ProviderReconciliationRun.objects.filter(pk=self.pk)
+            .values('status', *self.IDENTITY_FIELDS)
+            .first()
+        )
+
+    def save(self, *args, **kwargs):
+        """Refuse to rewrite what was compared, or to reopen a finished run.
+
+        A failed run in particular is never promoted to completed: it records
+        that a comparison was attempted and could not be carried out, which is
+        itself worth knowing. Trying again means a new run.
+        """
+        if self.pk is not None:
+            stored = self._stored()
+            if stored is not None:
+                changed = [
+                    field for field in self.IDENTITY_FIELDS
+                    if stored[field] != getattr(self, field)
+                ]
+                if changed:
+                    raise ReconciliationRunImmutableError(
+                        'What a reconciliation run compared cannot be changed.',
+                        details={'fields': sorted(changed)},
+                    )
+                if stored['status'] in ReconciliationRunStatus.TERMINAL:
+                    raise ReconciliationRunImmutableError(
+                        'That reconciliation run has already finished.',
+                        details={'run': self.pk, 'status': stored['status']},
+                    )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ReconciliationRunImmutableError(
+            'Reconciliation runs are permanent and cannot be deleted.'
+        )
+
+
+class ProviderReconciliationItemQuerySet(models.QuerySet):
+    """Findings are append-only."""
+
+    def update(self, **kwargs):
+        raise ReconciliationItemImmutableError(
+            'Reconciliation findings are permanent and cannot be updated.'
+        )
+
+    def delete(self):
+        raise ReconciliationItemImmutableError(
+            'Reconciliation findings are permanent and cannot be deleted.'
+        )
+
+
+class ProviderReconciliationItem(models.Model):
+    """One compared transfer, and what the comparison found.
+
+    Carries a **snapshot** of both sides as they stood when the run looked, so
+    the finding stays readable afterwards even as the transaction moves on. It
+    is evidence about a moment, not a live view.
+
+    Mismatches are independent boolean flags rather than one mutually exclusive
+    category: an item whose amount *and* currency both differ reports both,
+    where a single enum would have had to discard one.
+    """
+
+    IMMUTABLE_FIELDS = (
+        'reconciliation_run_id',
+        'provider_attempt_id',
+        'provider_key',
+        'provider_record_id',
+        'client_reference',
+        'provider_reference',
+        'overall_status',
+        'provider_outcome',
+        'internal_outcome',
+        'provider_amount_minor',
+        'internal_amount_minor',
+        'provider_currency',
+        'internal_currency',
+        'outcome_mismatch',
+        'amount_mismatch',
+        'currency_mismatch',
+        'reference_mismatch',
+        'has_recovery_conflict',
+    )
+
+    reconciliation_run = models.ForeignKey(
+        ProviderReconciliationRun,
+        on_delete=models.PROTECT,
+        related_name='items',
+    )
+    #: The execution this record turned out to be about. Null for a
+    #: provider-only finding — the provider knows about something we do not.
+    provider_attempt = models.ForeignKey(
+        ProviderExecutionAttempt,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='reconciliation_items',
+    )
+
+    provider_key = models.CharField(max_length=64)
+    #: Empty for an internal-only finding: there is no provider record.
+    provider_record_id = models.CharField(
+        max_length=PROVIDER_RECORD_ID_MAX_LENGTH, blank=True
+    )
+    client_reference = models.CharField(max_length=64, blank=True)
+    provider_reference = models.CharField(max_length=128, blank=True)
+
+    overall_status = models.CharField(
+        max_length=20, choices=ReconciliationStatus.CHOICES
+    )
+
+    # --- what each side said, snapshotted -------------------------------
+    provider_outcome = models.CharField(
+        max_length=20, choices=ReconciliationOutcome.CHOICES, blank=True
+    )
+    internal_outcome = models.CharField(
+        max_length=20, choices=ReconciliationOutcome.CHOICES, blank=True
+    )
+    provider_amount_minor = models.BigIntegerField(null=True, blank=True)
+    internal_amount_minor = models.BigIntegerField(null=True, blank=True)
+    provider_currency = models.CharField(
+        max_length=CURRENCY_CODE_LENGTH, blank=True
+    )
+    internal_currency = models.CharField(
+        max_length=CURRENCY_CODE_LENGTH, blank=True
+    )
+
+    # --- what differed --------------------------------------------------
+    outcome_mismatch = models.BooleanField(default=False)
+    amount_mismatch = models.BooleanField(default=False)
+    currency_mismatch = models.BooleanField(default=False)
+    reference_mismatch = models.BooleanField(default=False)
+
+    #: Surfaced from M7 rather than re-derived: an attempt already carrying
+    #: contradictory recovery evidence is exactly what an investigator needs to
+    #: see next to a reconciliation finding. Reconciliation does not resolve it.
+    has_recovery_conflict = models.BooleanField(default=False)
+
+    #: Provider observation time, as the provider reported it. Null for an
+    #: internal-only finding.
+    observed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = ProviderReconciliationItemQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'provider reconciliation item'
+        verbose_name_plural = 'provider reconciliation items'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(
+                    overall_status__in=sorted(ReconciliationStatus.ALL)
+                ),
+                name='moneycore_recon_item_status_valid',
+            ),
+            # A matched finding has nothing to report as different, and a
+            # discrepancy must name at least one difference. Enforced by the
+            # database so the two can never drift apart.
+            models.CheckConstraint(
+                check=(
+                    ~models.Q(overall_status=ReconciliationStatus.MATCHED)
+                    | models.Q(
+                        outcome_mismatch=False,
+                        amount_mismatch=False,
+                        currency_mismatch=False,
+                        reference_mismatch=False,
+                    )
+                ),
+                name='moneycore_recon_item_matched_has_no_mismatch',
+            ),
+            models.CheckConstraint(
+                check=(
+                    ~models.Q(overall_status=ReconciliationStatus.DISCREPANCY)
+                    | models.Q(outcome_mismatch=True)
+                    | models.Q(amount_mismatch=True)
+                    | models.Q(currency_mismatch=True)
+                    | models.Q(reference_mismatch=True)
+                ),
+                name='moneycore_recon_item_discrepancy_has_a_mismatch',
+            ),
+            # An internal-only finding has no provider record; every other
+            # kind has one.
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        overall_status=ReconciliationStatus.INTERNAL_ONLY,
+                        provider_record_id='',
+                    )
+                    | (
+                        ~models.Q(
+                            overall_status=ReconciliationStatus.INTERNAL_ONLY
+                        )
+                        & ~models.Q(provider_record_id='')
+                    )
+                ),
+                name='moneycore_recon_item_record_id_matches_status',
+            ),
+            # A provider-only finding has no attempt; every other kind has one.
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        overall_status=ReconciliationStatus.PROVIDER_ONLY,
+                        provider_attempt__isnull=True,
+                    )
+                    | (
+                        ~models.Q(
+                            overall_status=ReconciliationStatus.PROVIDER_ONLY
+                        )
+                        & models.Q(provider_attempt__isnull=False)
+                    )
+                ),
+                name='moneycore_recon_item_attempt_matches_status',
+            ),
+            # Within one run, a provider record is compared once...
+            models.UniqueConstraint(
+                fields=['reconciliation_run', 'provider_record_id'],
+                condition=~models.Q(provider_record_id=''),
+                name='moneycore_recon_item_one_per_record_per_run',
+            ),
+            # ...and an execution attempt appears once.
+            models.UniqueConstraint(
+                fields=['reconciliation_run', 'provider_attempt'],
+                condition=models.Q(provider_attempt__isnull=False),
+                name='moneycore_recon_item_one_per_attempt_per_run',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['reconciliation_run', 'overall_status']),
+            models.Index(fields=['client_reference']),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'ProviderReconciliationItem<{self.pk}: run '
+            f'{self.reconciliation_run_id} {self.overall_status}>'
+        )
+
+    @property
+    def discrepancy_codes(self) -> tuple[str, ...]:
+        """The differences this finding recorded, as stable codes."""
+        return tuple(
+            flag for flag in DISCREPANCY_FLAGS if getattr(self, flag)
+        )
+
+    def _stored(self):
+        return (
+            ProviderReconciliationItem.objects.filter(pk=self.pk)
+            .values(*self.IMMUTABLE_FIELDS)
+            .first()
+        )
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None:
+            stored = self._stored()
+            if stored is not None:
+                changed = [
+                    field for field in self.IMMUTABLE_FIELDS
+                    if stored[field] != getattr(self, field)
+                ]
+                if changed:
+                    raise ReconciliationItemImmutableError(
+                        'A reconciliation finding records what was observed '
+                        'and cannot be changed.',
+                        details={'fields': sorted(changed)},
+                    )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ReconciliationItemImmutableError(
+            'Reconciliation findings are permanent and cannot be deleted.'
         )

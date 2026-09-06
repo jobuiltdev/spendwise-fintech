@@ -1014,6 +1014,60 @@ adjustment or compensating entries, journal reversal, manual operations
 actions, a customer retry/resolve/refresh API, and any mobile change. No legacy
 `Expense` gained recovery evidence, and no evidence references one.
 
+## 17I. Decisions closed in M8 — reconciliation
+
+M8 answers: *does SpendWise's own financial record agree with what the provider
+says happened?* It detects, classifies and records. It repairs nothing.
+
+A provider export is **external evidence, not an instruction**. A system that
+quietly rewrote its own books to agree with someone else's file would have no
+books worth keeping — and the file is at least as likely to be the thing that
+is wrong. So every corrective action stays a human decision, taken with the
+evidence in front of them.
+
+| # | Decision | Detail |
+|---|---|---|
+| M8-1 | **Reconciliation is observational, and structurally cannot mutate money** | The service does not import and never calls `succeed_transfer`, `fail_transfer`, `mark_transfer_unknown`, `recover_provider_attempt`, `ingest_webhook`, `post_journal`, `reverse_journal`, `release_hold` or any M4/M5/M6/M7 mutator. Proved by AST walk over every call node and every import, and by a test asserting the only ORM writes target the two reconciliation tables. |
+| M8-2 | **Transfer-level scope only** | One provider record against one execution attempt. No statement import, no balance-level reconciliation, no settlement batches, no chargebacks, no cards, no fees, no tax. Those are later domains and none of them appears. |
+| M8-3 | **Provider record identity is `(provider_key, provider_record_id)`** | Nothing else. Identity derived from amount, recipient or timestamp would make reconciliation guess, and a reconciliation that guesses is worse than none. A provider that cannot supply stable record identity cannot be reconciled deterministically, and that is the provider's problem to solve. |
+| M8-4 | **Correlation is by reference, never by heuristic** | `client_reference` first — SpendWise owns it and M7 made it unique — with `provider_reference` corroborating and able to stand alone when it identifies exactly one attempt. **There is no fallback to amount, time, currency or recipient**, asserted by walking the matcher's AST for the attributes it reads. A record that merely looks like a transfer is not that transfer. |
+| M8-5 | **Contradictory references fail the run** | A record whose client and provider references name different executions raises `reconciliation_reference_conflict`. Believing one and ignoring the other is how a rail's evidence gets attached to the wrong customer's money. |
+| M8-6 | **One status plus independent mismatch flags, not a twenty-way enum** | `overall_status` is `matched`/`discrepancy`/`provider_only`/`internal_only`; the differences are four booleans. A record whose amount *and* currency both differ is one item with two flags, where a single mutually exclusive category would have had to discard one. Booleans rather than JSON or a child table: queryable and constrainable identically on both engines, and there are only four. Two check constraints tie them to the status — matched carries none, a discrepancy carries at least one. |
+| M8-7 | **`PROCESSING` and `UNKNOWN` both read as *unresolved*, never as failure** | An operation in flight, or one whose answer never came back, has not been established as not having happened. Reading either as failure is how a reconciliation report starts recommending that reserved funds be released on money that may already have gone. |
+| M8-8 | **Provider-only never creates anything** | An unmatched provider record is recorded as `provider_only` with a null attempt. It creates no transaction, no transfer, no attempt, and is never attached to whichever transfer looks closest — proved with a lookalike record of identical amount and currency. |
+| M8-9 | **Internal-only is not a failure** | An attempt the provider did not report is recorded as `internal_only`. An export delay, a window edge and "it never arrived" are indistinguishable from here, and concluding failure on that guess would release a customer's reservation. |
+| M8-10 | **Discrepancy and internal corruption are different things, kept apart** | SpendWise and the provider disagreeing is a discrepancy: expected, classified, survivable. SpendWise disagreeing with *itself* raises `reconciliation_internal_integrity_error` and fails the run, because filing a defect in our own ledger among the routine external noise would bury the one that matters. |
+| M8-11 | **The integrity rules, and what actually enforces them** | Succeeded requires a posted journal and a released reservation; failed requires no journal and a released reservation; unresolved requires no journal and a standing reservation; an attempt on a `CREATED` transaction is impossible since M6 starts the transaction first. **Attempting to corrupt the journal invariants by raw SQL is refused by M4's own check constraint** — a stronger guarantee than M8 detecting it — so those rules stand as defence in depth. The schema does *not* tie hold status to transaction status, and that is where M8's checking earns its place. |
+| M8-12 | **Duplicate provider records: identical is deduplicated, contradictory fails the run** | An export listing one record twice is ordinary. The same identity saying two different things means the export contradicts itself, and there is no correct way to choose — so `reconciliation_input_conflict` rather than reconciling against a guess. |
+| M8-13 | **Malformed provider data fails the run; no row is skipped** | A reconciliation that quietly drops rows it could not read reports a clean result while having compared less than it claims, which is worse than reporting nothing. |
+| M8-14 | **The provider fetch happens outside every database transaction** | Three phases: an atomic `STARTED` run, the paged read-only fetch holding nothing, then one atomic classify-and-record. Proved at runtime by asserting `connection.in_atomic_block is False` during the listing call, on an unwrapped connection. |
+| M8-15 | **Observation locks, and nothing wider** | Under `READ COMMITTED` each statement gets its own snapshot, so reading a transaction's status and then its hold could straddle a concurrent M6/M7 resolution and produce a state SpendWise was never in — `UNKNOWN` with a released hold — which reconciliation would report as *our* ledger being corrupt. The classification transaction therefore locks the `FinancialTransaction` row, then the `ProviderExecutionAttempt` row, and only then reads hold, journal, transfer and recovery evidence. |
+| M8-15a | **What is deliberately not locked** | **No wallet lock** — an audit must never be able to stall a customer's payment. No hold, journal or ledger-account lock: nothing may change those without first holding the transaction row, verified across M4-M7, so the transaction lock already settles them and locking them again would add ordering edges for nothing. Proved at runtime by spying on the SQL a run issues: `FOR UPDATE` names exactly two tables, neither statement joins, and the hold is read but never locked. |
+| M8-15b | **The attempt is never locked before its transaction** | Reconciliation joins the canonical wallet -> transaction -> attempt order one step in. Across a run the transactions are locked ascending by primary key and the attempts likewise, so **provider record order never reaches the locking** — asserted by handing a run its records in reverse. Two runs over overlapping windows, and a run racing three concurrent recoveries, complete without deadlock. |
+| M8-16 | **A race produces two honest observations, not a wrong one** | If a transaction resolves while a run is comparing, that run sees the resolution **entirely before or entirely after — never a mixture** — and a later run records the newer truth. Proved deterministically rather than by chance: a query wrapper stops the reconciling thread at the statement where a torn read would begin, and the resolving thread demonstrably cannot get past the row being held. Reverting the lock reproduces the false alarm (`An unresolved transaction no longer reserves the customer funds.`) and fails ten tests. Proved against both M7 recovery and M6 execution: no deadlock, no hung thread, exactly one journal, and a later run matches. |
+| M8-17 | **Windows are half-open `[start, end)` and timezone-aware** | Half-open so consecutive windows tile without overlap or gap and a record on the boundary belongs to exactly one run. Naive datetimes are refused: reconciliation that changed answer by deployment location would be worth nothing. **No maximum window length is invented.** |
+| M8-18 | **Inclusion is by `ProviderExecutionAttempt.started_at`** | Ours, immutable, and always present. A provider's export is keyed on *its* observation time, so in production the two views of a window can disagree at the edges and a transfer near a boundary may read as internal-only in one run and matched in the next. That is a property of comparing two clocks, not a defect; the production alignment rule stays open (O-49). |
+| M8-19 | **Each run is a new historical observation** | Reconciling the same window twice produces two runs. A rerun that overwrote the first would destroy the record that the answer had once been different — and that difference is often the most interesting thing in the file. Reruns over identical data agree, and neither alters the other. |
+| M8-20 | **Findings and finished runs are append-only** | A completed run's identity and window are fixed and it cannot be reopened; a failed run is never promoted to completed, because "we tried and could not" is itself worth knowing, and trying again means a new run. Items cannot be updated or deleted at all. |
+| M8-21 | **One provider record and one attempt appear at most once per run** | Two unique constraints, conditional so internal-only rows (no record id) and provider-only rows (no attempt) are unaffected. The same record may legitimately appear again in a *later* run. |
+| M8-22 | **Money stays integer minor units** | Provider record amounts are validated as positive whole minor units; `float`, `Decimal` and strings are refused. No `FloatField` or `DecimalField` exists on either model. |
+| M8-23 | **Currency stays generic** | Reconciliation reuses the existing ISO-4217 validation rather than narrowing to NGN. The product may only use one currency today; inventing a conflicting representation here would be a second, lossier definition of money. |
+| M8-24 | **Nothing raw is persisted** | No payload, body, headers, response, statement file or export blob — asserted field by field on both models. What crosses into the money core is already normalised; what cannot be normalised fails the run. |
+| M8-25 | **M7 contradictions stay visible** | An attempt already carrying contradictory recovery evidence is flagged `has_recovery_conflict` on the finding and counted in the summary. Surfaced, never resolved — an investigator reading a discrepancy needs to know the rail has already contradicted itself once. |
+| M8-26 | **Summary counts are derived, never stored** | A persisted counter is one more thing that can disagree with the rows it counts. |
+| M8-27 | **No scheduler, no queue, no Celery, no Redis** | Runs are invoked by the application. Nothing about correctness requires background processing: an unresolved discrepancy simply stays recorded until someone looks. Production cadence stays open (O-48). |
+| M8-28 | **No API, no ops tooling, no manual adjustment** | No customer or internal reconciliation endpoint, no admin registration, and no `mark_matched`, `force_match`, `force_success`, `manual_reconcile`, `adjust_balance` or `repair`. Classification is derived from evidence; acting on it is M11's. |
+| M8-29 | **The simulator states its records rather than generating them** | Reconciliation data is supplied to the constructor, so a scenario says exactly what the provider claims. Deterministic paging in a stable order, no randomness, no sleeping, no I/O — the same demo reproduces exactly. |
+
+### What M8 deliberately did not build
+
+Automatic remediation of any kind, journal reversal or compensating entries,
+balance adjustment, settlement or fee accounting, statement import,
+balance-level or batch reconciliation, chargebacks, a real provider
+integration, provider credentials, a scheduler, Celery, Redis, an outbox, an
+operations dashboard, a customer API, and any mobile change. No legacy
+`Expense` gained a reconciliation record, and no finding references one.
+
 ---
 
 ## 18. Deferred and open register
@@ -1080,8 +1134,16 @@ actions, a customer retry/resolve/refresh API, and any mobile change. No legacy
 | O-43 | Webhook HTTP routing and provider discovery. M7 keeps ingestion at the service level because routing would require choosing a partner; the service already takes exactly what a view would hand it | §17H M7-25 |
 | O-44 | Webhook secret storage and rotation, once a real provider exists | §17H M7-29 |
 | O-45 | Whether raw webhook bodies must be retained for compliance. M7 stores none — a production and legal decision, not an engineering one | §17H M7-23 |
-| O-46 | How operations acts on a recorded contradiction: escalation route, tooling, and whether a compensating entry is ever permitted. M7 records and refuses to guess | §17H M7-15 |
+| O-46 | How operations acts on a recorded contradiction: escalation route, tooling, and whether a compensating entry is ever permitted. **M7 records provider contradictions and M8 records reconciliation discrepancies; both refuse to guess, and neither reverses anything.** What a human is permitted to do about one remains open, and is M11's | §17H M7-15, §17I M8-10 |
 | O-47 | Whether unmatched authentic webhooks need alerting or a retention policy | §17H M7-21 |
+| O-48 | Production reconciliation cadence — how often to run, and by what trigger. M8 makes runs possible and deliberately schedules nothing | §17I M8-27 |
+| O-49 | **Production window semantics.** M8 selects internal candidates by `ProviderExecutionAttempt.started_at`; a real provider keys its export on its own observation time, so the two views can disagree at a window edge. How to align them — overlap, lag allowance, or reconciling on provider time — needs a real provider's export contract | §17I M8-18 |
+| O-50 | The provider reconciliation API or export mechanism: pull, push, file drop, cursor semantics, and how completeness is asserted | §17I M8-3 |
+| O-51 | Retention period for reconciliation runs and findings | §17I M8-20 |
+| O-52 | Discrepancy escalation thresholds — what volume or value of mismatch triggers what response, and to whom | §17I M8-10 |
+| O-53 | Whether raw provider statements must be retained for audit or compliance. M8 stores none | §17I M8-24 |
+| O-54 | Settlement and batch reconciliation scope, distinct from the transfer-level comparison M8 performs | §17I M8-2 |
+| O-55 | Reconciliation batch size and window length in production. A run now holds row locks on every transaction in its window for the duration of its classify-and-record transaction, so an unbounded window is a contention question as well as a memory one. M8 invents no maximum | §17I M8-15 |
 | O-2 | Rounding mode and remainder allocation for authoritative money | §7 |
 | O-3 | Reports' eventual placement | §12 |
 | O-4 | Whether NativeTabs can achieve the target glass treatment on the pinned Expo version | §13.1 |

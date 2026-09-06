@@ -262,11 +262,16 @@ class TestNoReconciliation:
             'statement', 'outboxmessage',
         })
 
-    def test_no_reconciliation_module_exists(self):
+    def test_no_settlement_or_outbox_module_exists(self):
+        """M8 added reconciliation deliberately; settlement is still later.
+
+        What this still guarantees is that reconciliation did not drag in
+        settlement, statement import or an outbox with it.
+        """
         names = {path.stem for path in _moneycore_package().rglob('*.py')}
 
         assert names.isdisjoint({
-            'reconciliation', 'reconcile', 'settlement', 'statements', 'outbox',
+            'reconcile', 'settlement', 'statements', 'outbox',
         })
 
     def test_no_balance_comparison_exists(self):
@@ -278,7 +283,7 @@ class TestNoReconciliation:
         ):
             assert not hasattr(provider_recovery, forbidden), forbidden
 
-    def test_the_model_set_is_exactly_m7(self):
+    def test_the_model_set_is_exactly_m8(self):
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
 
         assert declared == {
@@ -287,6 +292,7 @@ class TestNoReconciliation:
             'FundsHold', 'FinancialTransaction', 'Transfer',
             'ProviderExecutionAttempt',
             'ProviderRecoveryEvidence', 'ProviderWebhookEvent',
+            'ProviderReconciliationRun', 'ProviderReconciliationItem',
         }
 
 
@@ -557,7 +563,7 @@ class TestEarlierMilestonesUntouched:
 
 
 class TestMigrations:
-    def test_the_app_has_exactly_seven_migrations(self):
+    def test_the_app_has_exactly_eight_migrations(self):
         migrations_dir = _moneycore_package() / 'migrations'
         applied = sorted(
             path.stem
@@ -565,9 +571,9 @@ class TestMigrations:
             if path.stem != '__init__'
         )
 
-        assert len(applied) == 7
+        assert len(applied) == 8
         assert applied[0] == '0001_initial'
-        assert applied[-1].startswith('0007_')
+        assert applied[-1].startswith('0008_')
 
     def test_the_earlier_migrations_were_not_rewritten(self):
         migrations_dir = _moneycore_package() / 'migrations'

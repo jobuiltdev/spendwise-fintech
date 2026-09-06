@@ -87,7 +87,7 @@ class TestSchema:
             'started_at', 'finished_at', 'created_at', 'updated_at',
         }
 
-    def test_the_app_declares_exactly_the_models_through_m7(self):
+    def test_the_app_declares_exactly_the_models_through_m8(self):
         from django.apps import apps
 
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
@@ -98,6 +98,7 @@ class TestSchema:
             'FundsHold', 'FinancialTransaction', 'Transfer',
             'ProviderExecutionAttempt',
             'ProviderRecoveryEvidence', 'ProviderWebhookEvent',
+            'ProviderReconciliationRun', 'ProviderReconciliationItem',
         }
 
     def test_it_links_to_the_financial_transaction(self):
@@ -130,6 +131,7 @@ class TestSchema:
             'FinancialTransaction',
             'ProviderRecoveryEvidence',
             'ProviderWebhookEvent',
+            'ProviderReconciliationItem',
         }
         assert 'Transfer' not in related
 

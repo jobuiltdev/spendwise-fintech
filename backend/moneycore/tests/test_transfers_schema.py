@@ -63,6 +63,7 @@ class TestSchema:
             'Transfer',
             'ProviderExecutionAttempt',
             'ProviderRecoveryEvidence', 'ProviderWebhookEvent',
+            'ProviderReconciliationRun', 'ProviderReconciliationItem',
         }
 
     def test_it_links_to_exactly_one_financial_transaction(self):

@@ -39,6 +39,11 @@ from typing import Final
 from moneycore.domain.errors import (
     ProviderWebhookInvalidError,
     ProviderWebhookUnauthenticatedError,
+    ReconciliationProviderError,
+)
+from moneycore.domain.reconciliation import (
+    ProviderTransferRecord,
+    ProviderTransferRecordPage,
 )
 from moneycore.domain.recovery import (
     NormalisedWebhookEvent,
@@ -170,6 +175,9 @@ class SimulatorTransferProvider:
         status_scenario: str = StatusScenario.UNRESOLVED,
         status_failure_code: str = ProviderFailureCode.REQUEST_REJECTED,
         webhook_secret: bytes = SIMULATOR_TEST_WEBHOOK_SECRET,
+        reconciliation_records=(),
+        reconciliation_fails: bool = False,
+        reconciliation_page_size: int = 0,
     ) -> None:
         if transfer_scenario not in TransferScenario.ALL:
             raise ValueError(f'Unknown transfer scenario: {transfer_scenario!r}')
@@ -190,16 +198,25 @@ class SimulatorTransferProvider:
         self.status_scenario = status_scenario
         self.status_failure_code = status_failure_code
         self._webhook_secret = webhook_secret
+        #: Exactly what this rail will claim it handled. Supplied by the
+        #: caller so a scenario is stated rather than generated.
+        self.reconciliation_records = tuple(reconciliation_records)
+        self.reconciliation_fails = reconciliation_fails
+        self.reconciliation_page_size = reconciliation_page_size
 
         self._lock = threading.Lock()
         self._submit_calls = 0
         self._resolve_calls = 0
         self._status_calls = 0
+        self._reconciliation_calls = 0
         #: Every request the rail was actually asked to execute, in order.
         self.submitted_requests: list[ProviderTransferRequest] = []
         #: Hook for tests that need to observe the moment of the call itself —
         #: notably the proof that no database transaction is open during it.
         self.on_submit = None
+        #: Hook for tests observing the moment of the listing call —
+        #: notably the proof that no database transaction is open.
+        self.on_list_records = None
 
     # -- observation --------------------------------------------------
 
@@ -217,6 +234,11 @@ class SimulatorTransferProvider:
     def status_call_count(self) -> int:
         with self._lock:
             return self._status_calls
+
+    @property
+    def reconciliation_call_count(self) -> int:
+        with self._lock:
+            return self._reconciliation_calls
 
     # -- the adapter interface ----------------------------------------
 
@@ -422,6 +444,77 @@ class SimulatorTransferProvider:
             client_reference=payload.get('client_reference', ''),
             provider_reference=payload.get('provider_reference', ''),
             failure_code=payload.get('failure_code', ''),
+        )
+
+    # -- reconciliation -----------------------------------------------
+
+    def list_transfer_records(
+        self, *, window, cursor: str = ''
+    ) -> ProviderTransferRecordPage:
+        """List the transfers this simulated rail believes it handled.
+
+        Read-only and deterministic. The records come from whatever the test or
+        demo configured — there is no generation, no randomness and no
+        inference — so a scenario states exactly what the provider claims and
+        the comparison has something unambiguous to disagree with.
+
+        Records are filtered by ``observed_at`` against the half-open window,
+        then paged in a stable order, so the same configuration always produces
+        the same pages.
+        """
+        with self._lock:
+            self._reconciliation_calls += 1
+
+        if self.on_list_records is not None:
+            self.on_list_records(window)
+
+        if self.reconciliation_fails:
+            raise ReconciliationProviderError(
+                'The simulated rail could not list its records.'
+            )
+
+        in_window = [
+            record for record in self.reconciliation_records
+            if window.contains(record.observed_at)
+        ]
+        in_window.sort(key=lambda record: record.provider_record_id)
+
+        if self.reconciliation_page_size <= 0:
+            return ProviderTransferRecordPage(records=tuple(in_window))
+
+        offset = int(cursor) if cursor else 0
+        page = in_window[offset:offset + self.reconciliation_page_size]
+        next_offset = offset + len(page)
+        next_cursor = (
+            str(next_offset) if next_offset < len(in_window) else ''
+        )
+        return ProviderTransferRecordPage(
+            records=tuple(page), next_cursor=next_cursor
+        )
+
+    def record_matching(
+        self,
+        *,
+        provider_record_id: str,
+        client_reference: str,
+        outcome: str,
+        amount_minor: int,
+        currency: str,
+        observed_at,
+        provider_reference: str = '',
+        failure_code: str = '',
+    ) -> ProviderTransferRecord:
+        """Build one record this rail will report. A test/demo helper."""
+        return ProviderTransferRecord(
+            provider_key=self.provider_key,
+            provider_record_id=provider_record_id,
+            client_reference=client_reference,
+            provider_reference=provider_reference,
+            outcome=outcome,
+            amount_minor=amount_minor,
+            currency=currency,
+            observed_at=observed_at,
+            failure_code=failure_code,
         )
 
     # -- helpers ------------------------------------------------------

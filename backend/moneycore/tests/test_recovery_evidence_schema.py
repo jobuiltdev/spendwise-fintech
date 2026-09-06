@@ -92,7 +92,7 @@ def make_receipt(**overrides):
 
 
 class TestTheModelSet:
-    def test_the_app_declares_exactly_the_models_through_m7(self):
+    def test_the_app_declares_exactly_the_models_through_m8(self):
         from django.apps import apps
 
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
@@ -103,6 +103,7 @@ class TestTheModelSet:
             'FundsHold', 'FinancialTransaction', 'Transfer',
             'ProviderExecutionAttempt',
             'ProviderRecoveryEvidence', 'ProviderWebhookEvent',
+            'ProviderReconciliationRun', 'ProviderReconciliationItem',
         }
 
     def test_the_two_models_serve_different_concerns(self):
@@ -457,14 +458,16 @@ class TestAttemptImmutabilityIsUnchanged:
         with pytest.raises(ProviderAttemptImmutableError):
             attempt.save()
 
-    def test_recovery_added_only_reverse_accessors_to_the_attempt(self):
+    def test_only_reverse_accessors_were_added_to_the_attempt(self):
         reverse = {
             f.name
             for f in ProviderExecutionAttempt._meta.get_fields()
             if f.auto_created and not f.concrete
         }
 
-        assert reverse == {'recovery_evidence', 'webhook_events'}
+        assert reverse == {
+            'recovery_evidence', 'webhook_events', 'reconciliation_items'
+        }
 
     def test_the_attempt_gained_no_column(self):
         concrete = {

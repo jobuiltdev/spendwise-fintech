@@ -834,3 +834,125 @@ class ProviderWebhookUnmatchedError(ProviderRecoveryError, NotFoundError):
     default_message = (
         'That webhook refers to a request this system has no record of.'
     )
+
+
+# ===========================================================================
+# M8: reconciliation
+# ===========================================================================
+# Reconciliation compares and records. It never repairs, so nothing in this
+# section describes a correction — these are the ways a *comparison* can fail
+# to be carried out honestly.
+
+
+class ReconciliationError(DomainError):
+    """Base class for every reconciliation failure."""
+
+    code = 'reconciliation_error'
+    default_message = 'That reconciliation could not be completed.'
+
+
+class ReconciliationWindowInvalidError(ReconciliationError, ValidationError):
+    """The window is not a usable half-open interval of aware timestamps.
+
+    A naive datetime would be reinterpreted by whichever machine read it, and
+    reconciliation that changed answer by deployment location would be worth
+    nothing.
+    """
+
+    code = 'reconciliation_window_invalid'
+    default_message = 'That reconciliation window is not valid.'
+
+
+class ReconciliationProviderError(ReconciliationError, ProviderUnavailableError):
+    """The provider could not supply its records.
+
+    Says nothing about whether any transfer succeeded. The run is recorded as
+    having failed to run, and no financial state is touched.
+    """
+
+    code = 'reconciliation_provider_error'
+    default_message = (
+        'The provider records could not be retrieved. Nothing was changed.'
+    )
+
+
+class ReconciliationRecordInvalidError(ReconciliationError, ValidationError):
+    """A provider record could not be normalised into usable evidence.
+
+    The whole run fails rather than the row being skipped: a reconciliation
+    that quietly drops the rows it could not read reports a clean result while
+    having compared less than it claims, which is worse than reporting nothing.
+    """
+
+    code = 'reconciliation_record_invalid'
+    default_message = 'That provider record could not be read.'
+
+
+class ReconciliationInputConflictError(ReconciliationError, ConflictError):
+    """One provider record identity arrived twice saying different things.
+
+    Redelivery of the *same* record is expected and deduplicated. The same
+    identity carrying different contents means the export contradicts itself,
+    and picking a winner would be inventing an answer the provider did not
+    give. The run fails.
+    """
+
+    code = 'reconciliation_input_conflict'
+    default_message = (
+        'The provider records contradict themselves and cannot be reconciled.'
+    )
+
+
+class ReconciliationReferenceConflictError(ReconciliationError, ConflictError):
+    """A record's references identify more than one execution.
+
+    Matching by one reference and ignoring the contradiction in the other is
+    how evidence gets attached to the wrong customer's money.
+    """
+
+    code = 'reconciliation_reference_conflict'
+    default_message = (
+        'That provider record names more than one execution and cannot be '
+        'matched.'
+    )
+
+
+class ReconciliationInternalIntegrityError(ReconciliationError, ConflictError):
+    """SpendWise disagrees with itself, which is not a discrepancy.
+
+    A transaction claiming success with no journal behind it, a failure still
+    holding a customer's funds, or an unresolved operation that has somehow
+    posted — none of these is a difference of opinion with a provider. They are
+    defects in our own system that M2-M5 make impossible through supported
+    paths, and filing one as an ordinary discrepancy would bury it among the
+    external ones.
+    """
+
+    code = 'reconciliation_internal_integrity_error'
+    default_message = (
+        'Internal financial records are inconsistent and were not reconciled.'
+    )
+
+
+class ReconciliationRunImmutableError(ReconciliationError, ConflictError):
+    """A finished run records what one comparison found, and that is fixed."""
+
+    code = 'reconciliation_run_immutable'
+    default_message = (
+        'A completed reconciliation run cannot be changed or deleted.'
+    )
+
+
+class ReconciliationItemImmutableError(ReconciliationError, ConflictError):
+    """Reconciliation findings are permanent evidence.
+
+    A later run that sees different provider data records a **new** observation.
+    Rewriting the earlier one would destroy the only record that the two ever
+    disagreed.
+    """
+
+    code = 'reconciliation_item_immutable'
+    default_message = (
+        'A reconciliation finding is permanent and cannot be changed or '
+        'deleted.'
+    )

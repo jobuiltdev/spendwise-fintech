@@ -116,7 +116,7 @@ class TestNoProviderIntegration:
 
 
 class TestNoProviderOrRecipientConcepts:
-    def test_the_app_declares_exactly_the_models_through_m7(self):
+    def test_the_app_declares_exactly_the_models_through_m8(self):
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
 
         assert declared == {
@@ -128,9 +128,10 @@ class TestNoProviderOrRecipientConcepts:
             'ProviderExecutionAttempt',
             'ProviderRecoveryEvidence',
             'ProviderWebhookEvent',
+            'ProviderReconciliationRun', 'ProviderReconciliationItem',
         }
 
-    def test_no_m8_or_later_model_exists(self):
+    def test_no_m9_or_later_model_exists(self):
         declared = {
             m.__name__.lower() for m in apps.get_app_config('moneycore').get_models()
         }
@@ -205,7 +206,7 @@ class TestNoProviderOrRecipientConcepts:
         ):
             assert forbidden not in source
 
-    def test_the_app_has_exactly_seven_migrations(self):
+    def test_the_app_has_exactly_eight_migrations(self):
         migrations_dir = _moneycore_package() / 'migrations'
         applied = sorted(
             path.stem
@@ -213,7 +214,7 @@ class TestNoProviderOrRecipientConcepts:
             if path.stem != '__init__'
         )
 
-        assert len(applied) == 7
+        assert len(applied) == 8
         assert applied[0] == '0001_initial'
 
     def test_the_earlier_migrations_were_not_rewritten(self):
