@@ -87,7 +87,7 @@ class TestSchema:
             'started_at', 'finished_at', 'created_at', 'updated_at',
         }
 
-    def test_the_app_declares_exactly_the_models_through_m6(self):
+    def test_the_app_declares_exactly_the_models_through_m7(self):
         from django.apps import apps
 
         declared = {m.__name__ for m in apps.get_app_config('moneycore').get_models()}
@@ -97,6 +97,7 @@ class TestSchema:
             'LedgerAccount', 'Journal', 'JournalEntry',
             'FundsHold', 'FinancialTransaction', 'Transfer',
             'ProviderExecutionAttempt',
+            'ProviderRecoveryEvidence', 'ProviderWebhookEvent',
         }
 
     def test_it_links_to_the_financial_transaction(self):
@@ -106,14 +107,31 @@ class TestSchema:
         assert field.remote_field.on_delete is dj.PROTECT
 
     def test_it_does_not_link_to_the_transfer(self):
-        """The transaction is the financial lifecycle; the transfer is intent."""
+        """The transaction is the financial lifecycle; the transfer is intent.
+
+        M7 added reverse accessors for recovery evidence and webhook receipts —
+        both columns live on *those* models, so the attempt still points only
+        at the transaction.
+        """
+        concrete_related = {
+            f.related_model.__name__
+            for f in ProviderExecutionAttempt._meta.concrete_fields
+            if f.related_model is not None
+        }
+
+        assert concrete_related == {'FinancialTransaction'}
+
         related = {
             f.related_model.__name__
             for f in ProviderExecutionAttempt._meta.get_fields()
             if f.related_model is not None
         }
-
-        assert related == {'FinancialTransaction'}
+        assert related == {
+            'FinancialTransaction',
+            'ProviderRecoveryEvidence',
+            'ProviderWebhookEvent',
+        }
+        assert 'Transfer' not in related
 
     def test_the_provider_reference_is_nullable(self):
         field = ProviderExecutionAttempt._meta.get_field('provider_reference')

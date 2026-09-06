@@ -708,3 +708,129 @@ class AccountResolutionInvalidError(ProviderError, ValidationError):
 
     code = 'account_resolution_invalid'
     default_message = 'That account could not be looked up as given.'
+
+
+# ===========================================================================
+# M7: recovery — webhooks and status queries
+# ===========================================================================
+# Recovery is observational. Nothing in this section describes a submission
+# outcome, because M7 submits nothing; these describe what went wrong while
+# trying to *learn* the truth about a request already made.
+
+
+class ProviderRecoveryError(ProviderError):
+    """Base class for every recovery-boundary failure."""
+
+    code = 'provider_recovery_error'
+    default_message = 'That transfer could not be resolved.'
+
+
+class ProviderRecoveryNotAllowedError(ProviderRecoveryError, ConflictError):
+    """This attempt is not in a state that recovery applies to.
+
+    Recovery exists for unresolved truth — a claimed-but-unfinished attempt, or
+    one that finished ambiguously. An attempt that already recorded a
+    definitive answer has nothing to recover.
+    """
+
+    code = 'provider_recovery_not_allowed'
+    default_message = 'That provider attempt does not need recovery.'
+
+
+class ProviderRecoveryConflictError(ProviderRecoveryError, ConflictError):
+    """Definitive evidence contradicts what SpendWise already holds as settled.
+
+    Raised, never resolved silently. Picking a winner between "it succeeded"
+    and "it failed" would mean either fabricating a reversal or discarding
+    evidence, and both are worse than stopping. The evidence is kept, the
+    terminal outcome is left untouched, and a human decides — which is an
+    operations and reconciliation concern, not this milestone's.
+    """
+
+    code = 'provider_recovery_conflict'
+    default_message = (
+        'That evidence contradicts the settled outcome of this transfer.'
+    )
+
+
+class ProviderRecoveryReferenceMismatchError(ProviderRecoveryError, ConflictError):
+    """The references in this evidence point at different executions.
+
+    A client reference and a provider reference that name different attempts
+    cannot both be right, and guessing which to believe is how evidence gets
+    attached to the wrong customer's money.
+    """
+
+    code = 'provider_recovery_reference_mismatch'
+    default_message = (
+        'That evidence names more than one execution and cannot be applied.'
+    )
+
+
+class ProviderRecoveryResultInvalidError(ProviderRecoveryError, ValidationError):
+    """A status lookup returned something that is not an honest answer."""
+
+    code = 'provider_recovery_result_invalid'
+    default_message = 'That status result is not a valid answer.'
+
+
+class ProviderRecoveryEvidenceImmutableError(ProviderRecoveryError, ConflictError):
+    """Evidence is append-only historical truth.
+
+    Later knowledge is a new observation, never an edit of an older one. An
+    earlier "we could not tell" stays exactly that, even after a webhook says
+    the transfer succeeded.
+    """
+
+    code = 'provider_recovery_evidence_immutable'
+    default_message = (
+        'Recovery evidence is permanent and cannot be changed or deleted.'
+    )
+
+
+class ProviderWebhookInvalidError(ProviderRecoveryError, ValidationError):
+    """The delivery could not be normalised into an event we can act on."""
+
+    code = 'provider_webhook_invalid'
+    default_message = 'That webhook could not be understood.'
+
+
+class ProviderWebhookUnauthenticatedError(ProviderRecoveryError, AuthorizationError):
+    """The delivery did not authenticate.
+
+    Nothing is stored and nothing is resolved. The message deliberately says
+    only that it failed — echoing what was expected would hand an attacker the
+    other half of the signature.
+    """
+
+    code = 'provider_webhook_unauthenticated'
+    default_message = 'That webhook could not be authenticated.'
+
+
+class ProviderWebhookConflictError(ProviderRecoveryError, ConflictError):
+    """A redelivered event id carries different contents than the original.
+
+    Redelivery of the *same* event is idempotent and expected. The same
+    identity saying something different is not redelivery — it is a
+    contradiction, and the first recorded event is not overwritten.
+    """
+
+    code = 'provider_webhook_conflict'
+    default_message = (
+        'That webhook event id was already received with different contents.'
+    )
+
+
+class ProviderWebhookUnmatchedError(ProviderRecoveryError, NotFoundError):
+    """Authentic, but names a request SpendWise has no attempt for.
+
+    Deliberately not silent: an authenticated rail telling us about money we
+    have no record of is exactly the sort of thing operations must see. It
+    never creates a transaction, and it is never attached to the nearest
+    plausible one.
+    """
+
+    code = 'provider_webhook_unmatched'
+    default_message = (
+        'That webhook refers to a request this system has no record of.'
+    )

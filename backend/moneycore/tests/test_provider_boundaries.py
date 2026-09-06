@@ -1,8 +1,9 @@
 """What M6 must NOT have introduced.
 
-M6 is the provider *boundary* and a simulator. Resolving an ambiguous outcome,
-receiving webhooks and reconciling belong to later milestones, and none of them
-appears here.
+M6 is the provider *boundary* and a simulator. M7 has since added recovery —
+status queries and webhook ingestion — so the assertions here that M7
+deliberately supersedes are narrowed rather than deleted, and the rest still
+hold: reconciliation, real providers and customer APIs remain absent.
 """
 
 from pathlib import Path
@@ -57,34 +58,31 @@ def _production_sources():
 # ---------------------------------------------------------------------------
 
 
-class TestNoWebhook:
-    def test_no_webhook_model_exists(self):
-        declared = {
-            m.__name__.lower() for m in apps.get_app_config('moneycore').get_models()
-        }
+class TestWebhookIngestionStaysOutOfTheExecutionPath:
+    """M6 asserted no webhook existed at all; M7 added one deliberately.
 
-        assert declared.isdisjoint({
-            'webhook', 'webhookevent', 'webhookdelivery', 'providerevent',
-            'inboundevent',
-        })
+    What must still hold is that webhook handling lives in the recovery layer
+    and its adapter — never in the execution service, and never as an HTTP
+    route, because routing one would require picking a real provider.
+    """
 
-    def test_no_webhook_module_exists(self):
-        names = {
-            path.stem for path in _moneycore_package().rglob('*.py')
-        }
+    def test_the_execution_service_handles_no_webhook(self):
+        from moneycore.services import provider_execution
 
-        assert names.isdisjoint({
-            'webhooks', 'webhook', 'callbacks', 'inbound',
-        })
+        for forbidden in (
+            'handle_webhook', 'ingest_webhook', 'verify_webhook',
+            'parse_webhook',
+        ):
+            assert not hasattr(provider_execution, forbidden), forbidden
 
-    def test_no_webhook_handler_or_signature_check_exists(self):
+    def test_signature_verification_lives_only_in_the_adapter(self):
+        """No financial service may check a signature itself."""
         offenders = []
         for path in _production_sources():
+            if path.parts[-2:] == ('providers', 'simulator.py'):
+                continue
             source = path.read_text(encoding='utf-8').lower()
-            for marker in (
-                'def handle_webhook', 'webhook_signature', 'verify_signature',
-                'hmac', 'x-signature',
-            ):
+            for marker in ('hmac', 'compare_digest', 'x-signature'):
                 if marker in source:
                     offenders.append(f'{path.name}: {marker}')
 
@@ -514,7 +512,7 @@ class TestNoMobileSurface:
 
 
 class TestMigrations:
-    def test_the_app_has_exactly_six_migrations(self):
+    def test_the_app_has_exactly_seven_migrations(self):
         migrations_dir = _moneycore_package() / 'migrations'
         applied = sorted(
             path.stem
@@ -522,9 +520,9 @@ class TestMigrations:
             if path.stem != '__init__'
         )
 
-        assert len(applied) == 6
+        assert len(applied) == 7
         assert applied[0] == '0001_initial'
-        assert applied[-1].startswith('0006_')
+        assert applied[-1].startswith('0007_')
 
     def test_the_earlier_migrations_were_not_rewritten(self):
         migrations_dir = _moneycore_package() / 'migrations'

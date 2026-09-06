@@ -42,6 +42,7 @@ from moneycore.domain.errors import (
     HoldImmutableError,
     JournalImmutableError,
     ProviderAttemptImmutableError,
+    ProviderRecoveryEvidenceImmutableError,
     TransactionIntentImmutableError,
     TransferImmutableError,
 )
@@ -58,6 +59,13 @@ from moneycore.domain.providers import (
     PROVIDER_REFERENCE_MAX_LENGTH,
     ProviderAttemptStatus,
     ProviderOperation,
+)
+from moneycore.domain.recovery import (
+    CLIENT_REFERENCE_LOOKUP_MAX_LENGTH,
+    PROVIDER_EVENT_ID_MAX_LENGTH,
+    EvidenceSource,
+    RecoveryOutcome,
+    WebhookProcessingStatus,
 )
 from moneycore.domain.transfers import (
     ACCOUNT_NAME_MAX_LENGTH,
@@ -1269,6 +1277,17 @@ class ProviderExecutionAttempt(models.Model):
                 fields=['financial_transaction'],
                 name='moneycore_attempt_one_per_transaction',
             ),
+            # Added in M7. Recovery correlates evidence back to an execution by
+            # client_reference, so that lookup must be provably unambiguous
+            # rather than merely improbable. The values M6 generates are
+            # already unique by construction — a digest of immutable
+            # transaction identity, one attempt per transaction — so this adds
+            # no behaviour and rejects no existing row; it turns an assumption
+            # M7 depends on into a guarantee the database enforces.
+            models.UniqueConstraint(
+                fields=['client_reference'],
+                name='moneycore_attempt_unique_client_reference',
+            ),
             # A finished attempt records when; an unfinished one does not.
             models.CheckConstraint(
                 check=(
@@ -1365,4 +1384,298 @@ class ProviderExecutionAttempt(models.Model):
     def delete(self, *args, **kwargs):
         raise ProviderAttemptImmutableError(
             'Provider attempts are permanent history and cannot be deleted.'
+        )
+
+
+# ===========================================================================
+# M7: recovery evidence and webhook receipts
+# ===========================================================================
+# Two models, and they are deliberately not one.
+#
+# ProviderWebhookEvent is a *transport receipt*: proof that an authenticated
+# delivery arrived, keyed by the rail's own event identity so redelivery is
+# idempotent. It exists whether or not the event can be matched to anything —
+# an authentic rail telling us about money we have no record of is precisely
+# the kind of thing operations must be able to see.
+#
+# ProviderRecoveryEvidence is a *financial observation about one attempt*. It
+# always belongs to an attempt, and it comes from either source: a status query
+# we made, or a webhook we received. A matched webhook therefore produces both
+# rows — one receipt, one observation — because "this delivery arrived" and
+# "this is what we now believe about that execution" are different facts with
+# different lifetimes and different uniqueness rules.
+#
+# Neither stores a raw payload, headers, a signature or a credential. What is
+# not normalised is not evidence.
+
+
+class ProviderRecoveryEvidenceQuerySet(models.QuerySet):
+    """Append-only: evidence is never rewritten or removed."""
+
+    def update(self, **kwargs):
+        raise ProviderRecoveryEvidenceImmutableError(
+            'Recovery evidence is permanent and cannot be updated in bulk.'
+        )
+
+    def delete(self):
+        raise ProviderRecoveryEvidenceImmutableError(
+            'Recovery evidence is permanent and cannot be deleted.'
+        )
+
+
+class ProviderRecoveryEvidence(models.Model):
+    """One later observation about an execution attempt.
+
+    M6 made an attempt an immutable record of what a single interaction
+    observed. Recovery does not revise that record — an attempt that came back
+    ``unknown`` stays ``unknown`` forever, because that is what happened at the
+    time. What changes is what SpendWise *now believes*, and that belief lives
+    on the financial transaction, justified by rows here.
+
+    Append-only, so the sequence is readable afterwards: a status query that
+    could not tell, then a webhook that could, are two rows and remain two
+    rows. Editing the first into agreement with the second would destroy the
+    only record that SpendWise was ever uncertain.
+    """
+
+    #: Everything about an observation is fixed once written.
+    IMMUTABLE_FIELDS = (
+        'provider_attempt_id',
+        'source',
+        'outcome',
+        'provider_event_id',
+        'provider_reference',
+        'failure_code',
+    )
+
+    provider_attempt = models.ForeignKey(
+        ProviderExecutionAttempt,
+        on_delete=models.PROTECT,
+        related_name='recovery_evidence',
+    )
+    source = models.CharField(max_length=20, choices=EvidenceSource.CHOICES)
+    outcome = models.CharField(max_length=20, choices=RecoveryOutcome.CHOICES)
+    #: The rail's identity for a webhook delivery, so an observation can be
+    #: traced back to the receipt that produced it. Empty for a status query,
+    #: which has no natural provider-side observation id.
+    provider_event_id = models.CharField(
+        max_length=PROVIDER_EVENT_ID_MAX_LENGTH, blank=True
+    )
+    provider_reference = models.CharField(
+        max_length=PROVIDER_REFERENCE_MAX_LENGTH, blank=True
+    )
+    #: Normalised and provider-neutral, and only ever on a definitive failure.
+    failure_code = models.CharField(max_length=64, blank=True)
+    observed_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = ProviderRecoveryEvidenceQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'provider recovery evidence'
+        verbose_name_plural = 'provider recovery evidence'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(source__in=sorted(EvidenceSource.ALL)),
+                name='moneycore_evidence_source_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(outcome__in=sorted(RecoveryOutcome.ALL)),
+                name='moneycore_evidence_outcome_valid',
+            ),
+            # Only a definitive failure carries a failure code. An unresolved
+            # observation in particular may never borrow one.
+            models.CheckConstraint(
+                check=(
+                    models.Q(outcome=RecoveryOutcome.FAILED)
+                    | models.Q(failure_code='')
+                ),
+                name='moneycore_evidence_failure_code_only_when_failed',
+            ),
+            # A webhook delivery yields at most one observation, so redelivery
+            # cannot quietly stack duplicate evidence even if the receipt guard
+            # is somehow bypassed. Status queries have no such id and may
+            # legitimately repeat, so the constraint is conditional.
+            models.UniqueConstraint(
+                fields=['provider_event_id'],
+                condition=~models.Q(provider_event_id=''),
+                name='moneycore_evidence_unique_provider_event',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['provider_attempt', 'observed_at']),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'ProviderRecoveryEvidence<{self.pk}: attempt '
+            f'{self.provider_attempt_id} {self.source} {self.outcome}>'
+        )
+
+    @property
+    def is_definitive(self) -> bool:
+        return self.outcome in RecoveryOutcome.DEFINITIVE
+
+    def _stored(self):
+        return (
+            ProviderRecoveryEvidence.objects.filter(pk=self.pk)
+            .values(*self.IMMUTABLE_FIELDS)
+            .first()
+        )
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None:
+            stored = self._stored()
+            if stored is not None:
+                changed = [
+                    field for field in self.IMMUTABLE_FIELDS
+                    if stored[field] != getattr(self, field)
+                ]
+                if changed:
+                    raise ProviderRecoveryEvidenceImmutableError(
+                        'Recovery evidence records what was observed and '
+                        'cannot be changed.',
+                        details={'fields': sorted(changed)},
+                    )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ProviderRecoveryEvidenceImmutableError(
+            'Recovery evidence is permanent and cannot be deleted.'
+        )
+
+
+class ProviderWebhookEventQuerySet(models.QuerySet):
+    """Receipts are permanent; only their processing status ever moves."""
+
+    def delete(self):
+        raise ProviderRecoveryEvidenceImmutableError(
+            'Webhook receipts are permanent and cannot be deleted.'
+        )
+
+
+class ProviderWebhookEvent(models.Model):
+    """An authenticated delivery that arrived, recorded once.
+
+    Uniqueness on ``(provider_key, provider_event_id)`` is what makes
+    redelivery safe: rails deliver the same event once, twice, ten times or
+    concurrently, and the second arrival finds this row instead of resolving
+    anything a second time.
+
+    A delivery that fails authentication never reaches this table. There is no
+    ``invalid`` status, because an unauthenticated request is not an event —
+    storing one would give an attacker a way to fill the table.
+    """
+
+    IMMUTABLE_FIELDS = (
+        'provider_key',
+        'provider_event_id',
+        'outcome',
+        'client_reference',
+        'provider_reference',
+        'failure_code',
+    )
+
+    provider_key = models.CharField(max_length=64)
+    #: The rail's own identity for this delivery.
+    provider_event_id = models.CharField(max_length=PROVIDER_EVENT_ID_MAX_LENGTH)
+    outcome = models.CharField(max_length=20, choices=RecoveryOutcome.CHOICES)
+    client_reference = models.CharField(
+        max_length=CLIENT_REFERENCE_LOOKUP_MAX_LENGTH, blank=True
+    )
+    provider_reference = models.CharField(
+        max_length=PROVIDER_REFERENCE_MAX_LENGTH, blank=True
+    )
+    failure_code = models.CharField(max_length=64, blank=True)
+    processing_status = models.CharField(
+        max_length=20,
+        choices=WebhookProcessingStatus.CHOICES,
+        default=WebhookProcessingStatus.RECEIVED,
+    )
+    #: The execution this delivery turned out to be about, once matched.
+    provider_attempt = models.ForeignKey(
+        ProviderExecutionAttempt,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='webhook_events',
+    )
+    received_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = ProviderWebhookEventQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = 'provider webhook event'
+        verbose_name_plural = 'provider webhook events'
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(outcome__in=sorted(RecoveryOutcome.ALL)),
+                name='moneycore_webhook_outcome_valid',
+            ),
+            models.CheckConstraint(
+                check=models.Q(
+                    processing_status__in=sorted(WebhookProcessingStatus.ALL)
+                ),
+                name='moneycore_webhook_processing_status_valid',
+            ),
+            models.CheckConstraint(
+                check=~models.Q(provider_key=''),
+                name='moneycore_webhook_provider_key_present',
+            ),
+            models.CheckConstraint(
+                check=~models.Q(provider_event_id=''),
+                name='moneycore_webhook_event_id_present',
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(outcome=RecoveryOutcome.FAILED)
+                    | models.Q(failure_code='')
+                ),
+                name='moneycore_webhook_failure_code_only_when_failed',
+            ),
+            # The idempotency guarantee. One delivery identity, one row.
+            models.UniqueConstraint(
+                fields=['provider_key', 'provider_event_id'],
+                name='moneycore_webhook_unique_event_per_provider',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['processing_status', 'received_at']),
+            models.Index(fields=['client_reference']),
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f'ProviderWebhookEvent<{self.pk}: {self.provider_key} '
+            f'{self.provider_event_id} {self.outcome} {self.processing_status}>'
+        )
+
+    def _stored(self):
+        return (
+            ProviderWebhookEvent.objects.filter(pk=self.pk)
+            .values(*self.IMMUTABLE_FIELDS)
+            .first()
+        )
+
+    def save(self, *args, **kwargs):
+        """What the rail said is fixed; only our handling of it moves."""
+        if self.pk is not None:
+            stored = self._stored()
+            if stored is not None:
+                changed = [
+                    field for field in self.IMMUTABLE_FIELDS
+                    if stored[field] != getattr(self, field)
+                ]
+                if changed:
+                    raise ProviderRecoveryEvidenceImmutableError(
+                        'What a webhook reported cannot be changed.',
+                        details={'fields': sorted(changed)},
+                    )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ProviderRecoveryEvidenceImmutableError(
+            'Webhook receipts are permanent and cannot be deleted.'
         )

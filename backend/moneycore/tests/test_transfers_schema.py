@@ -62,6 +62,7 @@ class TestSchema:
             'FundsHold', 'FinancialTransaction',
             'Transfer',
             'ProviderExecutionAttempt',
+            'ProviderRecoveryEvidence', 'ProviderWebhookEvent',
         }
 
     def test_it_links_to_exactly_one_financial_transaction(self):

@@ -445,7 +445,7 @@ class TestNoMobileSurface:
 
 
 class TestMigrations:
-    def test_the_app_has_exactly_six_migrations(self):
+    def test_the_app_has_exactly_seven_migrations(self):
         migrations_dir = _moneycore_package() / 'migrations'
         applied = sorted(
             path.stem
@@ -453,9 +453,9 @@ class TestMigrations:
             if path.stem != '__init__'
         )
 
-        assert len(applied) == 6
+        assert len(applied) == 7
         assert applied[0] == '0001_initial'
-        assert applied[-1].startswith('0006_')
+        assert applied[-1].startswith('0007_')
 
     def test_the_earlier_migrations_were_not_rewritten(self):
         migrations_dir = _moneycore_package() / 'migrations'

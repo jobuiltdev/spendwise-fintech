@@ -30,9 +30,24 @@ network call.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import threading
 from typing import Final
 
+from moneycore.domain.errors import (
+    ProviderWebhookInvalidError,
+    ProviderWebhookUnauthenticatedError,
+)
+from moneycore.domain.recovery import (
+    NormalisedWebhookEvent,
+    ProviderTransferStatusFailed,
+    ProviderTransferStatusResult,
+    ProviderTransferStatusSucceeded,
+    ProviderTransferStatusUnresolved,
+    RecoveryOutcome,
+)
 from moneycore.domain.providers import (
     AccountResolutionFailureReason,
     ProviderAccountResolution,
@@ -47,6 +62,16 @@ from moneycore.domain.providers import (
 )
 
 SIMULATOR_PROVIDER_KEY: Final = 'simulator'
+
+#: A fixed, published, **test-and-demo-only** signing key. It is deliberately
+#: hardcoded and deliberately worthless: no real provider has been chosen, so
+#: there is no production secret to hold, and inventing an environment variable
+#: for one would be pretending otherwise. The signing scheme below is the
+#: simulator's own and matches no real provider's.
+SIMULATOR_TEST_WEBHOOK_SECRET: Final = b'simulator-test-secret-not-for-production'
+
+#: Header the simulator signs with. Its own convention, not anyone else's.
+SIMULATOR_SIGNATURE_HEADER: Final = 'X-Simulator-Signature'
 
 
 class TransferScenario:
@@ -70,6 +95,28 @@ class TransferScenario:
         AMBIGUOUS_AFTER_SUBMISSION,
         UNREACHABLE_BEFORE_SUBMISSION,
     })
+
+
+class StatusScenario:
+    """What a later status lookup reports, independently of the submission.
+
+    Deliberately separate from :class:`TransferScenario`: the whole point of
+    recovery is that a submission which came back ambiguous can later be found
+    to have succeeded. Configuring the two together would make that story
+    impossible to tell.
+    """
+
+    #: The rail states definitively that the request succeeded.
+    SUCCESS: Final = 'success'
+    #: The rail states definitively that it did not execute.
+    FAILURE: Final = 'failure'
+    #: The rail cannot currently say. Still not a failure.
+    UNRESOLVED: Final = 'unresolved'
+    #: The rail has no record of it. **Mapped to unresolved**, because for a
+    #: request that may never have arrived, "not found" establishes nothing.
+    NOT_FOUND: Final = 'not_found'
+
+    ALL: Final = frozenset({SUCCESS, FAILURE, UNRESOLVED, NOT_FOUND})
 
 
 class AccountResolutionScenario:
@@ -120,6 +167,9 @@ class SimulatorTransferProvider:
         transfer_scenario: str = TransferScenario.SUCCESS,
         account_resolution_scenario: str = AccountResolutionScenario.SUCCESS,
         failure_code: str = ProviderFailureCode.REQUEST_REJECTED,
+        status_scenario: str = StatusScenario.UNRESOLVED,
+        status_failure_code: str = ProviderFailureCode.REQUEST_REJECTED,
+        webhook_secret: bytes = SIMULATOR_TEST_WEBHOOK_SECRET,
     ) -> None:
         if transfer_scenario not in TransferScenario.ALL:
             raise ValueError(f'Unknown transfer scenario: {transfer_scenario!r}')
@@ -129,14 +179,22 @@ class SimulatorTransferProvider:
             )
         if failure_code not in ProviderFailureCode.ALL:
             raise ValueError(f'Unknown failure code: {failure_code!r}')
+        if status_scenario not in StatusScenario.ALL:
+            raise ValueError(f'Unknown status scenario: {status_scenario!r}')
+        if status_failure_code not in ProviderFailureCode.ALL:
+            raise ValueError(f'Unknown failure code: {status_failure_code!r}')
 
         self.transfer_scenario = transfer_scenario
         self.account_resolution_scenario = account_resolution_scenario
         self.failure_code = failure_code
+        self.status_scenario = status_scenario
+        self.status_failure_code = status_failure_code
+        self._webhook_secret = webhook_secret
 
         self._lock = threading.Lock()
         self._submit_calls = 0
         self._resolve_calls = 0
+        self._status_calls = 0
         #: Every request the rail was actually asked to execute, in order.
         self.submitted_requests: list[ProviderTransferRequest] = []
         #: Hook for tests that need to observe the moment of the call itself —
@@ -154,6 +212,11 @@ class SimulatorTransferProvider:
     def resolve_call_count(self) -> int:
         with self._lock:
             return self._resolve_calls
+
+    @property
+    def status_call_count(self) -> int:
+        with self._lock:
+            return self._status_calls
 
     # -- the adapter interface ----------------------------------------
 
@@ -230,6 +293,135 @@ class SimulatorTransferProvider:
         return ProviderTransferUnknown(
             ambiguity_reason='response_not_received',
             provider_reference='',
+        )
+
+    # -- recovery -----------------------------------------------------
+
+    def get_transfer_status(
+        self, *, client_reference: str, provider_reference: str = ''
+    ) -> ProviderTransferStatusResult:
+        """Report what became of a request already made.
+
+        Observational only: this sends nothing and moves nothing, which is why
+        it is safe to call repeatedly. The answer comes from ``status_scenario``
+        and is independent of what the original submission returned — that
+        independence is the whole point, because the story worth telling is a
+        submission that came back ambiguous and a lookup that later resolves it.
+        """
+        with self._lock:
+            self._status_calls += 1
+
+        if self.status_scenario == StatusScenario.SUCCESS:
+            return ProviderTransferStatusSucceeded(
+                provider_reference=provider_reference or f'SIM-{client_reference}'
+            )
+
+        if self.status_scenario == StatusScenario.FAILURE:
+            return ProviderTransferStatusFailed(
+                failure_code=self.status_failure_code,
+                provider_reference=provider_reference,
+            )
+
+        if self.status_scenario == StatusScenario.NOT_FOUND:
+            # Deliberately NOT a failure. For a request that may never have
+            # arrived, "no record" establishes nothing: it is equally an
+            # indexing delay, eventual consistency, or a key this rail does not
+            # index. Calling it failure would release a reservation on money
+            # that may already have gone.
+            return ProviderTransferStatusUnresolved(
+                reason='no_record_found',
+                provider_reference=provider_reference,
+            )
+
+        return ProviderTransferStatusUnresolved(
+            reason='still_processing', provider_reference=provider_reference
+        )
+
+    # -- webhooks -----------------------------------------------------
+
+    def sign_webhook(self, body: bytes) -> dict:
+        """The headers a delivery of ``body`` would carry. Test/demo helper."""
+        return {
+            SIMULATOR_SIGNATURE_HEADER: hmac.new(
+                self._webhook_secret, body, hashlib.sha256
+            ).hexdigest()
+        }
+
+    def build_webhook(
+        self,
+        *,
+        provider_event_id: str,
+        outcome: str,
+        client_reference: str = '',
+        provider_reference: str = '',
+        failure_code: str = '',
+    ) -> tuple:
+        """A deterministic signed delivery, for tests and the demo.
+
+        Returns the body and its headers, so a caller exercises exactly the
+        path a real delivery would: bytes in, verified event out.
+        """
+        payload = {
+            'event_id': provider_event_id,
+            'outcome': outcome,
+            'client_reference': client_reference,
+            'provider_reference': provider_reference,
+            'failure_code': failure_code,
+        }
+        body = json.dumps(payload, sort_keys=True).encode('utf-8')
+        return body, self.sign_webhook(body)
+
+    def verify_and_parse_webhook(
+        self, *, body: bytes, headers
+    ) -> NormalisedWebhookEvent:
+        """Authenticate a delivery and normalise it, in one step.
+
+        Deliberately inseparable: exposing a ``parse`` that worked on
+        unverified bytes would be an invitation to call it. If the signature
+        does not match, this raises and no event exists for anyone to act on.
+
+        The comparison is constant-time. The scheme is the simulator's own and
+        is not a claim about any real provider's.
+        """
+        provided = None
+        for name, value in dict(headers).items():
+            if name.lower() == SIMULATOR_SIGNATURE_HEADER.lower():
+                provided = value
+                break
+
+        if not provided:
+            raise ProviderWebhookUnauthenticatedError(
+                'That webhook could not be authenticated.'
+            )
+
+        expected = hmac.new(self._webhook_secret, body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(str(provided), expected):
+            # Deliberately says nothing about what was expected.
+            raise ProviderWebhookUnauthenticatedError(
+                'That webhook could not be authenticated.'
+            )
+
+        try:
+            payload = json.loads(body.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            raise ProviderWebhookInvalidError(
+                'That webhook body could not be read.'
+            ) from None
+
+        if not isinstance(payload, dict):
+            raise ProviderWebhookInvalidError(
+                'That webhook body was not an event.'
+            )
+
+        # Provider-shaped keys stop here. Everything past this point is the
+        # normalised domain event.
+        return NormalisedWebhookEvent(
+            provider_key=self.provider_key,
+            provider_event_id=payload.get('event_id', ''),
+            outcome=payload.get('outcome', ''),
+            client_reference=payload.get('client_reference', ''),
+            provider_reference=payload.get('provider_reference', ''),
+            failure_code=payload.get('failure_code', ''),
         )
 
     # -- helpers ------------------------------------------------------
