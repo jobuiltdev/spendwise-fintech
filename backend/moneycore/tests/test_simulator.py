@@ -1,6 +1,6 @@
 """The deterministic simulator.
 
-Determinism is the requirement: an investor demo must produce the same result
+Determinism is the requirement: a core scenario must produce the same result
 every time, and a concurrency test must be able to count calls exactly.
 """
 

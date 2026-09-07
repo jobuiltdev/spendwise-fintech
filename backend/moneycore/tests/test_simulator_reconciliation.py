@@ -180,7 +180,7 @@ class TestListingIsDeterministic:
 
 
 @pytest.mark.django_db
-class TestTheInvestorStory:
+class TestTheEndToEndScenario:
     """Ambiguity, resolution, a clean reconciliation — then a corrupted one."""
 
     @pytest.fixture

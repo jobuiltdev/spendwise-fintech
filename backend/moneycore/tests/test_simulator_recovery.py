@@ -1,6 +1,6 @@
-"""The simulator's recovery behaviour, and the demo it makes possible.
+"""The simulator's recovery behaviour, and the scenarios it makes possible.
 
-Determinism is the requirement: the investor story — ambiguity, then later
+Determinism is the requirement: the core scenario — ambiguity, then later
 resolution, with no resubmission — must reproduce exactly every time.
 """
 
@@ -188,7 +188,7 @@ class TestWebhookConstruction:
 
 
 @pytest.mark.django_db
-class TestTheInvestorDemo:
+class TestTheEndToEndScenarios:
     """Three deterministic stories, and no resubmission in any of them."""
 
     @pytest.fixture
